@@ -507,24 +507,24 @@ def _key_match(a, b):
     return False
 
 
-def _find_matching_brand_row(list_row, brand_rows):
+def _find_matching_brand_row(list_row, brand_matcher):
     """list 행과 brand 행 매칭:
     1) 동일: list(model_list+model_list_1+model_list_2) == brand(동일)
     2) list model_list 앞단만(첫 단어) + model_list_1+2 로 in/find 비교
     3) list model_list에서 앞 한 단어 지우고 나머지 + model_list_1+2 로 in/find 비교 (폭스바겐 더 뉴 파사트 → 더 뉴 파사트+... 와 brand 매칭)"""
+    if not brand_matcher:
+        return None
     list_key = _row_key(list_row)
     list_key_trim = _row_key(list_row, trim_model_list=True)
     list_key_drop = _row_key(list_row, drop_first_word=True)
-    for br in brand_rows:
-        brand_key = _row_key(br)
-        if list_key == brand_key:
-            return br
-    for br in brand_rows:
-        brand_key = _row_key(br)
+    exact_map = brand_matcher.get("exact", {})
+    key_rows = brand_matcher.get("key_rows", [])
+    if list_key and list_key in exact_map:
+        return exact_map[list_key]
+    for brand_key, br in key_rows:
         if _key_match(list_key_trim, brand_key):
             return br
-    for br in brand_rows:
-        brand_key = _row_key(br)
+    for brand_key, br in key_rows:
         if _key_match(list_key_drop, brand_key):
             return br
     return None
@@ -541,14 +541,36 @@ def load_brand_rows():
     return rows
 
 
+def build_brand_row_matcher(brand_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    brand 행 매칭용 사전/캐시 생성.
+    기존에는 list 행마다 brand_rows 전체를 돌며 key를 다시 계산해서
+    SUV/RV처럼 건수가 많은 구간에서 급격히 느려졌다.
+    """
+    exact_map: dict[str, dict[str, Any]] = {}
+    key_rows: list[tuple[str, dict[str, Any]]] = []
+    for row in brand_rows:
+        key = _row_key(row)
+        if not key:
+            continue
+        if key not in exact_map:
+            exact_map[key] = row
+        key_rows.append((key, row))
+    return {
+        "exact": exact_map,
+        "key_rows": key_rows,
+    }
+
+
 def merge_brand_into_list(raw_list, list_fields):
     """list.csv 행에 대해 brand.csv와 model_list+model_list_1+model_list_2로 매칭 후, 일치하면 brand_list~model_list_2 채움."""
     brand_rows = load_brand_rows()
     if not brand_rows:
         return
+    brand_matcher = build_brand_row_matcher(brand_rows)
     updated = 0
     for item in raw_list:
-        br = _find_matching_brand_row(item, brand_rows)
+        br = _find_matching_brand_row(item, brand_matcher)
         if br is None:
             continue
         item["brand_list"] = (br.get("brand_list") or "").strip()
@@ -1018,9 +1040,18 @@ def run_heydealer_job(
     raw_list: list[dict[str, Any]] = []
     seen: set[str] = set()
     brand_rows = load_brand_rows()
+    brand_matcher = build_brand_row_matcher(brand_rows)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--no-sandbox",
+            ],
+        )
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
@@ -1090,7 +1121,7 @@ def run_heydealer_job(
                             car_type=car_type_name,
                             brand_by_name=brand_by_name,
                         )
-                        br = _find_matching_brand_row(item, brand_rows)
+                        br = _find_matching_brand_row(item, brand_matcher)
                         if br:
                             item["brand_list"] = (br.get("brand_list") or "").strip()
                             item["car_list"] = (br.get("car_list") or "").strip()
@@ -1128,7 +1159,7 @@ def run_heydealer_job(
         run_logger.info(f"[1단계] 목록 CSV 생성 완료: {LIST_FILE} ({len(raw_list)}건)")
 
         if raw_list:
-            run_logger.info("[2단계] 목록 이미지 + 상세 이미지 수집")
+            run_logger.info("[2단계] 목록 이미지 + 상세 이미지 수집 시작 (%d건)", len(raw_list))
             for idx, item in enumerate(raw_list, 1):
                 product_id = item.get("product_id", "")
                 detail_url = item.get("detail_url", "")

@@ -1,45 +1,255 @@
-# -*- coding: utf-8 -*-
-"""
-롯데렌터카 T car 검색 페이지에서 차종 목록 수집.
-- #carTypeField .select-type-checked 내 li(name=chkCartype) 텍스트 수집 → lotterentacar_car_type_list.csv
-- 목록 수집: AJAX list/options API 사용 → lotterentacar_list.csv
-Airflow DAG(sdag_lotterentacar_crawler) 시 RESULT_DIR/LOG_DIR/IMG_BASE 사용 (config 미사용).
-"""
 import csv
 import json
 import logging
 import math
+import re
 import sys
 import time
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import date, datetime, time as dt_time
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, parse_qs
-import re
+from typing import Any
+from urllib.parse import parse_qs, urljoin, urlparse
+
+import pendulum
+import requests
+from airflow.decorators import dag, task, task_group
+from airflow.models import Variable
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from playwright.sync_api import sync_playwright
+
+
+@dag(
+    dag_id="sdag_lotterentacar_crawler",
+    schedule="@daily",
+    start_date=pendulum.datetime(2026, 3, 1, tz="Asia/Seoul"),
+    catchup=False,
+    render_template_as_native_obj=True,
+    tags=["used_car", "lotterentacar", "crawler", "day"],
+)
+def lotterentacar_crawler_dag():
+    """
+    롯데렌터카 브랜드/차종/목록 수집 DAG.
+
+    - DB 메타(std.tn_data_bsc_info, ps00006, data16/17/18) 조회
+    - 차종 CSV → 브랜드 CSV → 목록/이미지 순, 태스크별 파일 생성
+    """
+
+    # PostgresHook 객체 생성
+    pg_hook = PostgresHook(postgres_conn_id="car_db_conn")
+
+    @task
+    def insert_collect_data_info(**kwargs) -> dict[str, dict[str, Any]]:
+        """std.tn_data_bsc_info에서 롯데렌터카(ps00006) 수집 대상 기본 정보 조회."""
+        select_bsc_info_stmt = f"""
+        SELECT * FROM std.tn_data_bsc_info tdbi
+        WHERE 1=1
+          AND LOWER(clct_yn) = 'y'
+          AND LOWER(link_yn) = 'y'
+          AND LOWER(pvsn_site_cd) = 'ps00006'
+          AND LOWER(datst_cd) IN ('data16','data17','data18')
+        ORDER BY data_sn
+        """
+        logging.info("select_bsc_info_stmt ::: %s", select_bsc_info_stmt)
+        conn = pg_hook.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(select_bsc_info_stmt)
+                cols = [d[0] for d in cur.description]
+                out: dict[str, dict[str, Any]] = {}
+                for row in cur.fetchall() or []:
+                    raw = dict(zip(cols, row))
+                    d: dict[str, Any] = {}
+                    for k, v in raw.items():
+                        if isinstance(v, (datetime, date, dt_time)):
+                            d[k] = v.isoformat()
+                        else:
+                            d[k] = v
+                    k = str(d.get("datst_cd") or "").lower().strip()
+                    if k and k not in out:
+                        out[k] = d
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        missing = [
+            k
+            for k in (
+                LOTTERENTACAR_DATST_BRAND,
+                LOTTERENTACAR_DATST_CAR_TYPE,
+                LOTTERENTACAR_DATST_LIST,
+            )
+            if k not in out
+        ]
+        if missing:
+            raise ValueError(
+                f"std.tn_data_bsc_info 조회 결과 누락: {missing} (pvsn_site_cd={LOTTERENTACAR_PVSN_SITE_CD})"
+            )
+        return out
+
+    @task
+    def run_car_type_csv(infos: dict[str, dict[str, Any]]) -> str:
+        """[STEP1] 롯데렌터카 차종 CSV 생성."""
+        dc = str((infos.get(LOTTERENTACAR_DATST_CAR_TYPE) or {}).get("datst_cd") or LOTTERENTACAR_DATST_CAR_TYPE).lower()
+        return _run_lotterentacar_car_type_csv(dc)
+
+    @task
+    def run_brand_csv(infos: dict[str, dict[str, Any]]) -> str:
+        """[STEP2] 롯데렌터카 브랜드 CSV 생성."""
+        dc = str((infos.get(LOTTERENTACAR_DATST_BRAND) or {}).get("datst_cd") or LOTTERENTACAR_DATST_BRAND).lower()
+        return _run_lotterentacar_brand_csv(dc)
+
+    @task
+    def run_list_csv(
+        bsc_infos: dict[str, dict[str, Any]],
+        brand_csv_path: str,
+        car_type_csv_path: str,
+    ) -> dict[str, Any]:
+        """[STEP3] 롯데렌터카 목록/이미지 수집 후 list CSV 생성."""
+        bsc = BscInfo.from_row(bsc_infos[LOTTERENTACAR_DATST_LIST])
+        return run_lotterentacar_list_job(
+            bsc,
+            brand_list_csv_path=brand_csv_path,
+            car_type_csv_path=car_type_csv_path or None,
+        )
+
+    @task_group(group_id="create_csv_process")
+    def create_csv_process(bsc_infos: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        """차종/브랜드/목록 CSV 생성 그룹."""
+        car_type_path = run_car_type_csv(bsc_infos)
+        brand_path = run_brand_csv(bsc_infos)
+        return run_list_csv(bsc_infos, brand_path, car_type_path)
+
+    infos = insert_collect_data_info()
+    create_csv_process(infos)
+
 
 _root = Path(__file__).resolve().parent.parent
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
 
+# Airflow Variable (기존 크롤러 DAG와 동일)
+USED_CAR_SITE_NAMES_VAR = "used_car_site_names"
+CRAWL_BASE_PATH_VAR = "crawl_base_path"
+
+# DB `std.tn_data_bsc_info`: 롯데렌터카 제공사이트 코드
+LOTTERENTACAR_PVSN_SITE_CD = "ps00006"
+LOTTERENTACAR_DATST_BRAND = "data16"
+LOTTERENTACAR_DATST_CAR_TYPE = "data17"
+LOTTERENTACAR_DATST_LIST = "data18"
+LOTTERENTACAR_SITE_NAME = "롯데렌터카"
+
+
+def _get_crawl_base_path() -> Path:
+    try:
+        v = Variable.get(CRAWL_BASE_PATH_VAR, default_var=None)
+        if v:
+            return Path(str(v).strip())
+    except Exception:
+        pass
+    return Path(Variable.get("HEYDEALER_BASE_PATH", "/home/limhayoung/data"))
+
+
+def get_site_name_by_datst(datst_cd: str) -> str:
+    """Variable USED_CAR_SITE_NAMES(JSON)에서 datst_cd에 해당하는 한글 폴더명 조회."""
+    key = (datst_cd or "").lower().strip()
+    mapping: dict[str, Any] = {}
+    try:
+        raw = Variable.get(
+            USED_CAR_SITE_NAMES_VAR,
+            default_var="{}",
+            deserialize_json=True,
+        )
+        if isinstance(raw, dict):
+            mapping = {str(k).lower(): v for k, v in raw.items()}
+    except Exception:
+        mapping = {}
+    name = mapping.get(key)
+    if name is not None and str(name).strip():
+        return str(name).strip()
+    return LOTTERENTACAR_SITE_NAME
+
+
+def get_lotterentacar_site_name() -> str:
+    """
+    롯데렌터카는 brand/data16, car_type/data17, list/data18가 모두 같은 사이트이므로
+    datst_cd와 무관하게 동일한 폴더명을 사용한다.
+    """
+    for datst_cd in (
+        LOTTERENTACAR_DATST_LIST,
+        LOTTERENTACAR_DATST_BRAND,
+        LOTTERENTACAR_DATST_CAR_TYPE,
+    ):
+        site_name = get_site_name_by_datst(datst_cd)
+        if site_name and site_name.strip():
+            return site_name
+    return LOTTERENTACAR_SITE_NAME
+
+
+@dataclass(frozen=True)
+class BscInfo:
+    pvsn_site_cd: str
+    datst_cd: str
+    dtst_nm: str
+    link_url: str
+    clct_yn: str
+    link_yn: str
+    incr_yn: str
+    clct_mthd: str
+    target_table: str | None = None
+
+    @staticmethod
+    def from_row(row: dict[str, Any]) -> "BscInfo":
+        def _s(k: str) -> str:
+            v = row.get(k)
+            return "" if v is None else str(v)
+
+        return BscInfo(
+            pvsn_site_cd=_s("pvsn_site_cd"),
+            datst_cd=_s("datst_cd"),
+            dtst_nm=_s("dtst_nm"),
+            link_url=_s("link_url") or _s("link_data_clct_url"),
+            clct_yn=_s("clct_yn"),
+            link_yn=_s("link_yn"),
+            incr_yn=_s("incr_yn"),
+            clct_mthd=_s("clct_mthd"),
+            target_table=(row.get("target_table") or row.get("trgt_tbl_nm") or row.get("target_tbl"))
+            and str(row.get("target_table") or row.get("trgt_tbl_nm") or row.get("target_tbl")),
+        )
+
+
+def activate_paths_for_datst(datst_cd: str) -> None:
+    """롯데렌터카 공통 crawl / log / img 루트 경로 설정 (각 Task 시작 시 호출)."""
+    global RESULT_DIR, LOG_DIR, IMG_BASE, YEAR_STR, DATE_STR, RUN_TS
+
+    base = _get_crawl_base_path()
+    site = get_lotterentacar_site_name()
+    now = datetime.now()
+    YEAR_STR = now.strftime("%Y년")
+    DATE_STR = now.strftime("%Y%m%d")
+    RUN_TS = now.strftime("%Y%m%d%H%M")
+
+    RESULT_DIR = base / "crawl" / YEAR_STR / site / DATE_STR
+    LOG_DIR = base / "log" / YEAR_STR / site / DATE_STR
+    IMG_BASE = base / "img" / YEAR_STR / site / DATE_STR
+
+
+# 경로는 activate_paths_for_datst()에서 설정 (DAG import 시 기본값)
+YEAR_STR = ""
+DATE_STR = ""
+RUN_TS = ""
+RESULT_DIR = Path("/tmp")
+LOG_DIR = Path("/tmp")
+IMG_BASE = Path("/tmp")
+
 try:
-    from pendulum import datetime as pd_datetime
+    activate_paths_for_datst(LOTTERENTACAR_DATST_LIST)
 except Exception:
-    pd_datetime = None
-
-from airflow.decorators import dag, task
-
-_now = datetime.now()
-YEAR_STR = _now.strftime("%Y년")
-DATE_STR = _now.strftime("%Y%m%d")
-BASE_DATA_PATH = Path("/home/limhayoung/data")
-
-RESULT_DIR = BASE_DATA_PATH / "crawl" / YEAR_STR / "롯데렌터카" / DATE_STR
-LOG_DIR = BASE_DATA_PATH / "log" / YEAR_STR / "롯데렌터카" / DATE_STR
-IMG_BASE = BASE_DATA_PATH / "img" / YEAR_STR / "롯데렌터카" / DATE_STR
+    pass
 
 HEADLESS_MODE = True
-
-import requests
-from playwright.sync_api import sync_playwright
 
 
 def _lotterentacar_list_img_dir(dt=None):
@@ -137,22 +347,47 @@ def _normalize_text(text):
     return " ".join((text or "").strip().split())
 
 
-def setup_logger():
-    """로그 디렉터리: project_root/logs/lotterentacar, 파일명: lotterentacar_type_to_list.log"""
-    log_dir = Path(__file__).resolve().parent.parent / "logs" / "lotterentacar"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "lotterentacar_type_to_list.log"
-    logger = logging.getLogger("LotterentacarTypeList")
+def get_logger():
+    """Airflow 기본 로깅 사용."""
+    return logging.getLogger("lotterentacar")
+
+
+def _get_file_logger(run_ts: str) -> logging.Logger:
+    """
+    Airflow 태스크 로그(UI)와 별개로, LOG_DIR에도 파일 로그를 남기기 위한 로거.
+    - 파일: LOG_DIR/lotterentacar_crawler_{run_ts}.log
+    """
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("lotterentacar_crawler")
     logger.setLevel(logging.INFO)
-    if not logger.handlers:
-        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-        fh = logging.FileHandler(log_path, encoding="utf-8")
-        fh.setFormatter(formatter)
-        logger.addHandler(fh)
-        sh = logging.StreamHandler()
-        sh.setFormatter(formatter)
-        logger.addHandler(sh)
+    log_path = str(LOG_DIR / f"lotterentacar_crawler_{run_ts}.log")
+    for h in logger.handlers:
+        if isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None) == log_path:
+            return logger
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(fh)
     return logger
+
+
+def setup_logger():
+    """standalone 실행 시 사용하는 파일 로거."""
+    run_ts = datetime.now().strftime("%Y%m%d%H%M")
+    return _get_file_logger(run_ts)
+
+
+def _launch_browser(playwright, headless: bool):
+    """WSL/Airflow 환경에서 Chromium을 조금 더 안정적으로 실행."""
+    return playwright.chromium.launch(
+        headless=headless,
+        args=[
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--no-sandbox",
+        ],
+    )
 
 
 def run_lotterentacar_car_type_list(page, result_dir: Path, logger, csv_path: Path | None = None):
@@ -802,7 +1037,7 @@ def run_lotterentacar_fetch_detail_images(result_dir: Path, logger, list_csv_pat
     logger.info("상세 페이지 이미지 저장 시작 (총 %d건, 저장 경로: %s)", len(rows), img_dir)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = _launch_browser(p, HEADLESS_MODE)
         try:
             context = browser.new_context(
                 viewport={"width": 1280, "height": 720},
@@ -1080,7 +1315,7 @@ def run_lotterentacar_fetch_list_images(
     saved = 0
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = _launch_browser(p, HEADLESS_MODE)
         try:
             context = browser.new_context(
                 viewport={"width": 1280, "height": 720},
@@ -1288,101 +1523,127 @@ def run_lotterentacar_list(page, result_dir: Path, logger, list_csv_path: Path |
         logger.error("리스트 수집 오류: %s", e, exc_info=True)
 
 
-@dag(
-    dag_id="sdag_lotterentacar_crawler",
-    schedule="@daily",
-    start_date=(pd_datetime(2026, 3, 1, tz="Asia/Seoul") if pd_datetime else datetime(2026, 3, 1)),
-    catchup=False,
-    render_template_as_native_obj=True,
-    tags=["used_car", "lotterentacar", "full_logic"],
-)
-def lotterentacar_crawler_dag():
-
-    def _get_file_logger(run_ts: str) -> logging.Logger:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        logger = logging.getLogger("lotterentacar_crawler")
-        logger.setLevel(logging.INFO)
-        log_path = str(LOG_DIR / f"lotterentacar_crawler_{run_ts}.log")
-        for h in logger.handlers:
-            if isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None) == log_path:
-                return logger
-        fh = logging.FileHandler(log_path, encoding="utf-8")
-        fh.setLevel(logging.INFO)
-        fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-        logger.addHandler(fh)
-        return logger
-
-    @task
-    def prepare_environment():
-        RESULT_DIR.mkdir(parents=True, exist_ok=True)
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        (IMG_BASE / "list").mkdir(parents=True, exist_ok=True)
-        (IMG_BASE / "detail").mkdir(parents=True, exist_ok=True)
-        run_ts = datetime.now().strftime("%Y%m%d%H%M")
-        _get_file_logger(run_ts).info("🏁 lotterentacar crawler start")
-        return run_ts
-
-    @task
-    def run_meta(run_ts: str):
-        logger = _get_file_logger(run_ts)
-        car_type_csv = RESULT_DIR / f"lotterentacar_car_type_list_{run_ts}.csv"
-        brand_csv = RESULT_DIR / f"lotterentacar_brand_list_{run_ts}.csv"
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=HEADLESS_MODE)
-            try:
-                context = browser.new_context(
-                    viewport={"width": 1280, "height": 720},
-                    user_agent=REQUEST_HEADERS.get(
-                        "User-Agent",
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    ),
-                )
-                page = context.new_page()
-                run_lotterentacar_car_type_list(page, RESULT_DIR, logger, csv_path=car_type_csv)
-                run_lotterentacar_brand_list(page, RESULT_DIR, logger, csv_path=brand_csv)
-            finally:
-                browser.close()
-        return {"run_ts": run_ts}
-
-    @task
-    def run_list_ajax(meta: dict):
-        run_ts = meta["run_ts"]
-        logger = _get_file_logger(run_ts)
-        list_csv = RESULT_DIR / f"lotterentacar_list_{run_ts}.csv"
-        run_lotterentacar_list_via_ajax(RESULT_DIR, logger, list_csv_path=list_csv)
-        return meta
-
-    @task
-    def run_list_images(meta: dict):
-        run_ts = meta["run_ts"]
-        logger = _get_file_logger(run_ts)
-        list_csv = RESULT_DIR / f"lotterentacar_list_{run_ts}.csv"
-        run_lotterentacar_fetch_list_images(
-            RESULT_DIR,
-            logger,
-            list_csv_path=list_csv,
-            img_dir=IMG_BASE / "list",
+def _run_lotterentacar_car_type_csv(datst_cd: str) -> str:
+    """차종 CSV 수집 Task (data17)."""
+    activate_paths_for_datst((datst_cd or LOTTERENTACAR_DATST_CAR_TYPE).lower() or LOTTERENTACAR_DATST_CAR_TYPE)
+    run_ts = datetime.now().strftime("%Y%m%d%H%M")
+    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    logger = _get_file_logger(run_ts)
+    car_type_csv = RESULT_DIR / f"lotterentacar_car_type_list_{run_ts}.csv"
+    logger.info("차종 CSV 저장 경로: %s", car_type_csv)
+    with sync_playwright() as p:
+        browser = _launch_browser(p, HEADLESS_MODE)
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 720},
+            user_agent=REQUEST_HEADERS.get(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            ),
         )
-        return "SUCCESS"
+        page = context.new_page()
+        try:
+            run_lotterentacar_car_type_list(page, RESULT_DIR, logger, csv_path=car_type_csv)
+        finally:
+            browser.close()
+    return str(car_type_csv)
 
-    run_ts = prepare_environment()
-    meta = run_meta(run_ts)
-    ajax = run_list_ajax(meta)
-    images = run_list_images(ajax)
-    run_ts >> meta >> ajax >> images
+
+def _run_lotterentacar_brand_csv(datst_cd: str) -> str:
+    """브랜드 CSV 수집 Task (data16)."""
+    activate_paths_for_datst((datst_cd or LOTTERENTACAR_DATST_BRAND).lower() or LOTTERENTACAR_DATST_BRAND)
+    run_ts = datetime.now().strftime("%Y%m%d%H%M")
+    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    logger = _get_file_logger(run_ts)
+    brand_csv = RESULT_DIR / f"lotterentacar_brand_list_{run_ts}.csv"
+    logger.info("브랜드 CSV 저장 경로: %s", brand_csv)
+    with sync_playwright() as p:
+        browser = _launch_browser(p, HEADLESS_MODE)
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 720},
+            user_agent=REQUEST_HEADERS.get(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            ),
+        )
+        page = context.new_page()
+        try:
+            run_lotterentacar_brand_list(page, RESULT_DIR, logger, csv_path=brand_csv)
+        finally:
+            browser.close()
+    return str(brand_csv)
+
+
+def run_lotterentacar_list_job(
+    bsc: BscInfo,
+    *,
+    brand_list_csv_path: str,
+    car_type_csv_path: str | None = None,
+) -> dict[str, Any]:
+    """
+    DB 메타 1건(목록 datst) 기준 롯데렌터카 목록/이미지 수집.
+    브랜드 CSV는 앞단 Task에서 생성한 절대경로를 사용한다.
+    """
+    activate_paths_for_datst((bsc.datst_cd or LOTTERENTACAR_DATST_LIST).lower() or LOTTERENTACAR_DATST_LIST)
+    run_ts = datetime.now().strftime("%Y%m%d%H%M")
+    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    (IMG_BASE / "list").mkdir(parents=True, exist_ok=True)
+
+    logger = _get_file_logger(run_ts)
+    brand_path = Path(brand_list_csv_path)
+    if not brand_path.is_file():
+        raise FileNotFoundError(
+            f"브랜드 CSV가 없습니다. run_brand_csv 태스크를 먼저 성공시키고 brand_list_csv_path를 확인하세요: {brand_path}"
+        )
+    if car_type_csv_path and not Path(car_type_csv_path).is_file():
+        logger.warning("차종 CSV 경로 없음(무시하고 진행): %s", car_type_csv_path)
+
+    logger.info("🏁 롯데렌터카 목록 수집 시작")
+    logger.info("- pvsn_site_cd=%s, datst_cd=%s, dtst_nm=%s", bsc.pvsn_site_cd, bsc.datst_cd, bsc.dtst_nm)
+    logger.info("- link_url=%s", bsc.link_url)
+    logger.info("- 브랜드 CSV(이전 태스크): %s", brand_path)
+
+    list_path = RESULT_DIR / f"lotterentacar_list_{run_ts}.csv"
+    if list_path.exists():
+        list_path.unlink()
+
+    run_lotterentacar_list_via_ajax(RESULT_DIR, logger, list_csv_path=list_path)
+    run_lotterentacar_fetch_list_images(
+        RESULT_DIR,
+        logger,
+        list_csv_path=list_path,
+        img_dir=IMG_BASE / "list",
+    )
+
+    count = 0
+    if list_path.exists():
+        with open(list_path, "r", encoding="utf-8-sig") as f:
+            count = sum(1 for _ in csv.DictReader(f))
+    logger.info("✅ 롯데렌터카 목록 수집 완료: 총 %d건", count)
+    return {
+        "brand_csv": str(brand_path),
+        "car_type_csv": car_type_csv_path or "",
+        "list_csv": str(list_path),
+        "count": count,
+        "log_dir": str(LOG_DIR),
+        "img_base": str(IMG_BASE),
+    }
 
 
 lotterentacar_dag = lotterentacar_crawler_dag()
 
 
 def main():
+    activate_paths_for_datst(LOTTERENTACAR_DATST_LIST)
     logger = setup_logger()
-    result_dir = Path(__file__).resolve().parent.parent / "result" / "lotterentacar"
+    result_dir = RESULT_DIR
     result_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) 차종 목록 수집 → lotterentacar_car_type_list.csv
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = _launch_browser(p, HEADLESS_MODE)
         try:
             context = browser.new_context(
                 viewport={"width": 1280, "height": 720},

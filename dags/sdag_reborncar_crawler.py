@@ -193,8 +193,40 @@ def load_brand_model_map(result_dir, brand_path: Path | None = None):
         pass
     return model_to_brand, model_to_car_list, composite_to_model, composite_short_to_model, model_list_to_row
 
+# 브랜드 필터에 없는 차종(리본카에서 판매되나 필터에 없는 경우) 수동 매핑
+# (브랜드명, 차종명) -> 목록 car_name에서 model/model_list_1/model_list_2 파싱에 사용
+KNOWN_CAR_FALLBACK: dict[str, tuple[str, str]] = {
+    "스파크": ("셰보레", "스파크"),
+    "트랙스": ("셰보레", "트랙스"),
+    "말리부": ("셰보레", "말리부"),
+    "올란도": ("셰보레", "올란도"),
+    "임팔라": ("셰보레", "임팔라"),
+    "볼트": ("셰보레", "볼트"),
+    "크루즈": ("셰보레", "크루즈"),
+}
+
+
+def _parse_known_car_fallback(lp_car_name: str, lp_car_trim: str, car_key: str) -> tuple[str, str, str, str, str]:
+    """브랜드 목록에 없는 알려진 차종(car_key)일 때 (brand, car, model, model_list_1, model_list_2) 파싱."""
+    brand, car = KNOWN_CAR_FALLBACK[car_key]
+    full = _normalize_composite_key(lp_car_name, lp_car_trim)
+    idx = full.find(car_key)
+    if idx < 0:
+        return brand, car, car_key, "", ""
+    end_idx = idx + len(car_key)
+    model = full[:end_idx].strip()
+    rest = full[end_idx:].strip()
+    parts = rest.split()
+    m1 = parts[0] if parts else ""
+    m2 = parts[1] if len(parts) > 1 else ""
+    return (brand, car, model or car_key, m1, m2)
+
+
 def _get_model_key_for_lp_car_name(lp_car_name, model_keys):
-    """lp_car_name으로 model_keys 중 매칭되는 키 반환. 없으면 None."""
+    """lp_car_name으로 model_keys 중 매칭되는 키 반환. 없으면 None.
+    - 전체/마지막 단어 매칭
+    - 추가: car_name에 model_key가 포함된 경우 (가장 긴 매칭 우선)
+    """
     name = (lp_car_name or "").strip()
     if not name or not model_keys:
         return None
@@ -205,7 +237,15 @@ def _get_model_key_for_lp_car_name(lp_car_name, model_keys):
         last_part = parts[-1].strip()
         if last_part in model_keys:
             return last_part
+    # 포함 매칭: car_name에 model_key가 단어 단위로 포함된 경우
+    name_words = set(name.split())
+    for mk in sorted(model_keys, key=len, reverse=True):
+        if not mk:
+            continue
+        if mk in name_words or (mk in name and name.strip().startswith(mk)):
+            return mk
     return None
+
 
 def get_brand_for_lp_car_name(lp_car_name, model_to_brand):
     """lp_car_name과 brand의 model_list(| 앞) 매칭. 실패 시 lp_car_name 뒤에서 띄어쓰기 기준 마지막 부분으로 재매칭."""
@@ -248,6 +288,23 @@ def get_brand_car_model_for_list_row(lp_car_name, lp_car_trim, composite_to_mode
         if car_name_full.startswith(model_list_key) or car_name_no_first.startswith(model_list_key):
             return model_list_to_row[model_list_key]
 
+    # 보완: model_list가 car_name에 포함된 경우 (띄어쓰기 단위, 예: "캐스퍼" in "캐스퍼 가솔린 1.0")
+    for model_list_key in sorted(model_list_to_row.keys(), key=len, reverse=True):
+        if not model_list_key:
+            continue
+        # car_name의 단어 중 model_list_key와 일치하거나, car_name이 model_list_key로 시작
+        if (
+            model_list_key in car_name_full.split()
+            or car_name_full.startswith(model_list_key + " ")
+            or car_name_no_first.startswith(model_list_key + " ")
+        ):
+            return model_list_to_row[model_list_key]
+
+    # 브랜드 목록에 없는 알려진 차종(스파크 등) fallback
+    for car_key in KNOWN_CAR_FALLBACK:
+        if car_key in (name or ""):
+            return _parse_known_car_fallback(name, trim, car_key)
+
     return "-", "-", "-", "-", "-"
 
 def split_boname_by_last_paren(text):
@@ -281,6 +338,27 @@ def normalize_production_period(text):
     return s
 
 
+def _safe_click(page, locator, logger, *, timeout: int = 15000, desc: str = "") -> bool:
+    """클릭 재시도 2번 + force fallback (오버레이/스크롤 등으로 타임아웃 시 사용)."""
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            locator.click(timeout=timeout)
+            return True
+        except Exception as e:
+            if attempt < max_retries:
+                logger.warning(f"클릭 재시도 ({attempt + 1}/{max_retries}) {desc}: {e}")
+                page.wait_for_timeout(500 * (attempt + 1))
+            else:
+                try:
+                    locator.click(force=True, timeout=5000)
+                    return True
+                except Exception as e2:
+                    logger.warning(f"force 클릭 실패 {desc}: {e2}")
+                    return False
+    return False
+
+
 def run_reborncar_brand(page, result_dir, logger, csv_path: Path | None = None, pnttm: str | None = None, create_dt: str | None = None):
     """브랜드·차종·모델·트림·옵션 계층 수집 → reborncar_brand_list.csv (crawl_reborncar_brand.py와 동일 방식)."""
     if pnttm is None:
@@ -308,7 +386,8 @@ def run_reborncar_brand(page, result_dir, logger, csv_path: Path | None = None, 
                 brand_box = brand_selectors.nth(i)
                 brand_list = brand_box.locator(".brand-name label span").inner_text().strip()
                 logger.info(f"[{brand_list}] 처리 중...")
-                brand_box.locator(".brand-name label").click()
+                if not _safe_click(page, brand_box.locator(".brand-name label"), logger, desc="brand"):
+                    continue
                 page.wait_for_timeout(400)
 
                 car_items = brand_box.locator(".car-list .check-box[class*='car-']")
@@ -317,7 +396,8 @@ def run_reborncar_brand(page, result_dir, logger, csv_path: Path | None = None, 
                 for j in range(car_count):
                     car_box = car_items.nth(j)
                     car_list = car_box.locator("label span").first.inner_text().strip()
-                    car_box.locator("label").first.click()
+                    if not _safe_click(page, car_box.locator("label").first, logger, desc=f"car {car_list}"):
+                        continue
                     page.wait_for_timeout(300)
 
                     # 모델만 선택 (트림/옵션 check-box 제외: class에 model- 포함된 것만)
@@ -332,7 +412,8 @@ def run_reborncar_brand(page, result_dir, logger, csv_path: Path | None = None, 
                                 split_boname_by_last_paren(full_boname)
                             )
                             production_period_val = normalize_production_period(production_period_val)
-                            model_box.locator("label").first.click()
+                            if not _safe_click(page, model_box.locator("label").first, logger, desc=f"model {model_list_val}", timeout=20000):
+                                continue
                             page.wait_for_timeout(200)
 
                             trim_boxes = model_box.locator(".trim-list.depth04 .check-box[class*='trim-']")
@@ -362,7 +443,8 @@ def run_reborncar_brand(page, result_dir, logger, csv_path: Path | None = None, 
                                     trim_name = trim_el.locator("label span").inner_text().strip()
                                 except Exception:
                                     trim_name = ""
-                                trim_el.locator("label").click()
+                                if not _safe_click(page, trim_el.locator("label"), logger, desc=f"trim {trim_name}", timeout=20000):
+                                    continue
                                 page.wait_for_timeout(250)
                                 # 현재 트림 요소 안에서만 옵션 조회 (트렌디/프레스티지/노블레스 등 해당 트림 옵션만 수집)
                                 option_boxes = trim_el.locator(".option-list.depth05 .check-box[class*='option-']")
@@ -527,6 +609,13 @@ def save_detail_images(page, product_id, save_dir, detail_url, logger):
         src = list_imgs.nth(i).get_attribute("src")
         if src:
             urls.append(src)
+    # 3) fallback: vip-visual 내 모든 img
+    if not urls:
+        fallback_imgs = page.locator("#wrap .vip-section .vip-visual img[src]")
+        for i in range(fallback_imgs.count()):
+            src = fallback_imgs.nth(i).get_attribute("src")
+            if src and src not in urls:
+                urls.append(src)
     saved_count = 0
     for idx, src in enumerate(urls, start=1):
         try:
@@ -576,8 +665,9 @@ def fetch_detail_images_only(page, product_id, img_save_dir, logger):
     """상세 페이지 접속 후 vip-visual 이미지만 저장 (detail CSV 없음)."""
     detail_url = f"https://www.reborncar.co.kr/smartbuy/SB1002.rb?productId={product_id}"
     try:
-        page.goto(detail_url, wait_until="domcontentloaded")
-        page.wait_for_selector(".vip-section .vip-visual", state="visible", timeout=10000)
+        page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_selector(".vip-section .vip-visual", state="attached", timeout=15000)
+        page.wait_for_timeout(1500)  # lazy 로드 이미지 대기
         save_detail_images(page, product_id, img_save_dir, detail_url, logger)
     except Exception as e:
         logger.warning(f"이미지 저장 스킵 ({product_id}): {e}")
@@ -653,7 +743,6 @@ def run_reborncar_list_job(
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     (IMG_BASE / "list").mkdir(parents=True, exist_ok=True)
-    (IMG_BASE / "detail").mkdir(parents=True, exist_ok=True)
 
     logger = _get_file_logger(run_ts)
     brand_path = Path(brand_list_csv_path)
@@ -687,7 +776,6 @@ def run_reborncar_list_job(
         list_path.unlink()
 
     list_img_save_dir = IMG_BASE / "list"
-    detail_img_save_dir = IMG_BASE / "detail"
 
     TEST_PAGE_LIMIT = None
     list_url = (bsc.link_url or "").strip() or "https://www.reborncar.co.kr/smartbuy/SB1001.rb"
@@ -704,11 +792,9 @@ def run_reborncar_list_job(
             locale="ko-KR",
         )
         page = context.new_page()
-        detail_page = context.new_page()
-        for pg in (page, detail_page):
-            pg.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-            )
+        page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
         try:
             logger.info("리본카 목록 페이지 접속...")
             _open_reborncar_list_page(page, list_url, logger)
@@ -842,9 +928,6 @@ def run_reborncar_list_job(
                                     wl.writeheader()
                                 wl.writerow(list_row)
 
-                            if v_product_id and v_status not in ["준비중", "판매완료"]:
-                                fetch_detail_images_only(detail_page, v_product_id, detail_img_save_dir, logger)
-
                             car_counter += 1
                         except Exception as e:
                             logger.error(f"항목 수집 실패: {e}")
@@ -892,11 +975,13 @@ def run_reborncar_list_job(
         finally:
             browser.close()
 
+    total_count = car_counter - 1
+    logger.info(f"✅ 리본카 목록 수집 완료: 총 {total_count:,}건")
     return {
         "brand_csv": str(brand_path),
         "car_type_csv": car_type_csv_path or "",
         "list_csv": str(list_path),
-        "count": car_counter - 1,
+        "count": total_count,
         "log_dir": str(LOG_DIR),
         "img_base": str(IMG_BASE),
     }
