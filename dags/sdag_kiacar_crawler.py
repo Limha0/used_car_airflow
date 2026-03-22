@@ -1,6 +1,368 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+기아 인증중고(CPO) 브랜드/목록 수집 DAG.
+
+Airflow DAG:
+- DB 메타(std.tn_data_bsc_info, ps00005, data13/15) 조회
+- 브랜드 CSV → 목록 CSV → enrich 순으로 단계별 Task 실행
+"""
+import csv
+import importlib.util
+import logging
+import sys
+from dataclasses import dataclass
+from datetime import date, datetime, time as dt_time
+from pathlib import Path
+from typing import Any
+
+import pendulum
+from airflow.decorators import dag, task, task_group
+from airflow.models import Variable
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from playwright.sync_api import sync_playwright
+
+
+@dag(
+    dag_id="sdag_kiacar_crawler",
+    schedule="@daily",
+    start_date=pendulum.datetime(2026, 3, 1, tz="Asia/Seoul"),
+    catchup=False,
+    render_template_as_native_obj=True,
+    tags=["used_car", "kiacar", "crawler", "day"],
+)
+def kiacar_crawler_dag():
+    """
+    기아 인증중고 브랜드/목록 수집 DAG.
+
+    - DB 메타(std.tn_data_bsc_info, ps00005, data13/15) 조회
+    - 브랜드 CSV → 목록 CSV → enrich 순, 태스크별 파일 생성
+    """
+
+    pg_hook = PostgresHook(postgres_conn_id="car_db_conn")
+
+    @task
+    def insert_collect_data_info(**kwargs) -> dict[str, dict[str, Any]]:
+        select_bsc_info_stmt = f"""
+        SELECT * FROM std.tn_data_bsc_info tdbi
+        WHERE 1=1
+          AND LOWER(clct_yn) = 'y'
+          AND LOWER(link_yn) = 'y'
+          AND LOWER(pvsn_site_cd) = '{KIACAR_PVSN_SITE_CD}'
+          AND LOWER(datst_cd) IN ('data13','data15')
+        ORDER BY data_sn
+        """
+        logging.info("select_bsc_info_stmt ::: %s", select_bsc_info_stmt)
+        conn = pg_hook.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(select_bsc_info_stmt)
+                cols = [d[0] for d in cur.description]
+                out: dict[str, dict[str, Any]] = {}
+                for row in cur.fetchall() or []:
+                    raw = dict(zip(cols, row))
+                    d: dict[str, Any] = {}
+                    for k, v in raw.items():
+                        if isinstance(v, (datetime, date, dt_time)):
+                            d[k] = v.isoformat()
+                        else:
+                            d[k] = v
+                    k = str(d.get("datst_cd") or "").lower().strip()
+                    if k and k not in out:
+                        out[k] = d
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        missing = [k for k in (KIACAR_DATST_BRAND, KIACAR_DATST_LIST, KIACAR_DATST_ENRICH) if k not in out]
+        if missing:
+            raise ValueError(
+                f"std.tn_data_bsc_info 조회 결과 누락: {missing} (pvsn_site_cd={KIACAR_PVSN_SITE_CD})"
+            )
+        return out
+
+    @task
+    def run_brand_csv(infos: dict[str, dict[str, Any]]) -> str:
+        dc = str((infos.get(KIACAR_DATST_BRAND) or {}).get("datst_cd") or KIACAR_DATST_BRAND).lower()
+        return _run_kiacar_brand_csv(dc)
+
+    @task
+    def run_list_csv(infos: dict[str, dict[str, Any]], brand_csv_path: str) -> str:
+        dc = str((infos.get(KIACAR_DATST_LIST) or {}).get("datst_cd") or KIACAR_DATST_LIST).lower()
+        return _run_kiacar_list_csv(dc, brand_csv_path)
+
+    @task
+    def run_enrich_csv(
+        infos: dict[str, dict[str, Any]],
+        brand_csv_path: str,
+        list_csv_path: str,
+    ) -> dict[str, Any]:
+        dc = str((infos.get(KIACAR_DATST_ENRICH) or {}).get("datst_cd") or KIACAR_DATST_ENRICH).lower()
+        return _run_kiacar_enrich_csv(dc, brand_csv_path, list_csv_path)
+
+    @task_group(group_id="create_csv_process")
+    def create_csv_process(bsc_infos: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        brand_path = run_brand_csv(bsc_infos)
+        list_path = run_list_csv(bsc_infos, brand_path)
+        return run_enrich_csv(bsc_infos, brand_path, list_path)
+
+    infos = insert_collect_data_info()
+    create_csv_process(infos)
+
+
+_root = Path(__file__).resolve().parent.parent
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
+
+USED_CAR_SITE_NAMES_VAR = "used_car_site_names"
+CRAWL_BASE_PATH_VAR = "crawl_base_path"
+
+KIACAR_PVSN_SITE_CD = "ps00005"
+KIACAR_DATST_BRAND = "data13"
+KIACAR_DATST_LIST = "data15"
+KIACAR_DATST_ENRICH = "data15"
+KIACAR_SITE_NAME = "기아인증중고"
+
+LEGACY_KIACAR_SCRIPT = Path("/home/limhayoung/used_car_crawler/kiacar/crawl_kiacar_type_to_list.py")
+
+
+@dataclass(frozen=True)
+class BscInfo:
+    pvsn_site_cd: str
+    datst_cd: str
+    dtst_nm: str
+    link_url: str
+    clct_yn: str
+    link_yn: str
+    incr_yn: str
+    clct_mthd: str
+    target_table: str | None = None
+
+    @staticmethod
+    def from_row(row: dict[str, Any]) -> "BscInfo":
+        def _s(k: str) -> str:
+            v = row.get(k)
+            return "" if v is None else str(v)
+
+        return BscInfo(
+            pvsn_site_cd=_s("pvsn_site_cd"),
+            datst_cd=_s("datst_cd"),
+            dtst_nm=_s("dtst_nm"),
+            link_url=_s("link_url") or _s("link_data_clct_url"),
+            clct_yn=_s("clct_yn"),
+            link_yn=_s("link_yn"),
+            incr_yn=_s("incr_yn"),
+            clct_mthd=_s("clct_mthd"),
+            target_table=(row.get("target_table") or row.get("trgt_tbl_nm") or row.get("target_tbl"))
+            and str(row.get("target_table") or row.get("trgt_tbl_nm") or row.get("target_tbl")),
+        )
+
+
+def _get_crawl_base_path() -> Path:
+    try:
+        v = Variable.get(CRAWL_BASE_PATH_VAR, default_var=None)
+        if v:
+            return Path(str(v).strip())
+    except Exception:
+        pass
+    return Path(Variable.get("HEYDEALER_BASE_PATH", "/home/limhayoung/data"))
+
+
+def get_site_name_by_datst(datst_cd: str) -> str:
+    key = (datst_cd or "").lower().strip()
+    mapping: dict[str, Any] = {}
+    try:
+        raw = Variable.get(USED_CAR_SITE_NAMES_VAR, default_var="{}", deserialize_json=True)
+        if isinstance(raw, dict):
+            mapping = {str(k).lower(): v for k, v in raw.items()}
+    except Exception:
+        mapping = {}
+    name = mapping.get(key)
+    if name is not None and str(name).strip():
+        return str(name).strip()
+    return KIACAR_SITE_NAME
+
+
+def get_kiacar_site_name() -> str:
+    for datst_cd in (KIACAR_DATST_LIST, KIACAR_DATST_BRAND, KIACAR_DATST_ENRICH):
+        site_name = get_site_name_by_datst(datst_cd)
+        if site_name and site_name.strip():
+            return site_name
+    return KIACAR_SITE_NAME
+
+
+def activate_paths_for_datst(datst_cd: str) -> None:
+    global RESULT_DIR, LOG_DIR, IMG_BASE, YEAR_STR, DATE_STR, RUN_TS
+
+    base = _get_crawl_base_path()
+    site = get_kiacar_site_name()
+    now = datetime.now()
+    YEAR_STR = now.strftime("%Y년")
+    DATE_STR = now.strftime("%Y%m%d")
+    RUN_TS = now.strftime("%Y%m%d%H%M")
+
+    RESULT_DIR = base / "crawl" / YEAR_STR / site / DATE_STR
+    LOG_DIR = base / "log" / YEAR_STR / site / DATE_STR
+    IMG_BASE = base / "img" / YEAR_STR / site / DATE_STR
+
+
+YEAR_STR = ""
+DATE_STR = ""
+RUN_TS = ""
+RESULT_DIR = Path("/tmp")
+LOG_DIR = Path("/tmp")
+IMG_BASE = Path("/tmp")
+
+try:
+    activate_paths_for_datst(KIACAR_DATST_LIST)
+except Exception:
+    pass
+
+HEADLESS_MODE = True
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+
+def _get_file_logger(run_ts: str) -> logging.Logger:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("kiacar_crawler")
+    logger.setLevel(logging.INFO)
+    log_path = str(LOG_DIR / f"kiacar_crawler_{run_ts}.log")
+    for h in logger.handlers:
+        if isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", None) == log_path:
+            return logger
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(fh)
+    return logger
+
+
+def _launch_browser(playwright, headless: bool):
+    return playwright.chromium.launch(
+        headless=headless,
+        args=[
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--no-sandbox",
+        ],
+    )
+
+
+def _load_legacy_kiacar_module():
+    if not LEGACY_KIACAR_SCRIPT.exists():
+        raise FileNotFoundError(f"legacy kiacar source not found: {LEGACY_KIACAR_SCRIPT}")
+    legacy_root = LEGACY_KIACAR_SCRIPT.parent.parent
+    if str(legacy_root) not in sys.path:
+        sys.path.insert(0, str(legacy_root))
+    spec = importlib.util.spec_from_file_location("legacy_kiacar_crawler", LEGACY_KIACAR_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"legacy kiacar source load failed: {LEGACY_KIACAR_SCRIPT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _count_csv_rows(csv_path: Path) -> int:
+    if not csv_path.exists():
+        return 0
+    with open(csv_path, "r", encoding="utf-8-sig") as f:
+        return sum(1 for _ in csv.DictReader(f))
+
+
+def _run_kiacar_brand_csv(datst_cd: str) -> str:
+    activate_paths_for_datst((datst_cd or KIACAR_DATST_BRAND).lower() or KIACAR_DATST_BRAND)
+    run_ts = datetime.now().strftime("%Y%m%d%H%M")
+    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    logger = _get_file_logger(run_ts)
+    legacy = _load_legacy_kiacar_module()
+
+    with sync_playwright() as p:
+        browser = _launch_browser(p, HEADLESS_MODE)
+        context = browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 800})
+        page = context.new_page()
+        try:
+            legacy.run_kiacar_brand_list(page, RESULT_DIR, logger)
+        finally:
+            browser.close()
+    return str(RESULT_DIR / "kiacar_brand_list.csv")
+
+
+def _run_kiacar_list_csv(datst_cd: str, brand_csv_path: str) -> str:
+    activate_paths_for_datst((datst_cd or KIACAR_DATST_LIST).lower() or KIACAR_DATST_LIST)
+    run_ts = datetime.now().strftime("%Y%m%d%H%M")
+    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    (IMG_BASE / "list").mkdir(parents=True, exist_ok=True)
+    logger = _get_file_logger(run_ts)
+    brand_path = Path(brand_csv_path)
+    if not brand_path.is_file():
+        raise FileNotFoundError(f"브랜드 CSV가 없습니다: {brand_path}")
+
+    legacy = _load_legacy_kiacar_module()
+    with sync_playwright() as p:
+        browser = _launch_browser(p, HEADLESS_MODE)
+        context = browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 800})
+        page = context.new_page()
+        try:
+            legacy.run_kiacar_product_list(page, RESULT_DIR, logger)
+        finally:
+            browser.close()
+    return str(RESULT_DIR / "kiacar_list.csv")
+
+
+def _run_kiacar_enrich_csv(datst_cd: str, brand_csv_path: str, list_csv_path: str) -> dict[str, Any]:
+    activate_paths_for_datst((datst_cd or KIACAR_DATST_ENRICH).lower() or KIACAR_DATST_ENRICH)
+    run_ts = datetime.now().strftime("%Y%m%d%H%M")
+    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    logger = _get_file_logger(run_ts)
+
+    brand_path = Path(brand_csv_path)
+    list_path = Path(list_csv_path)
+    if not brand_path.is_file():
+        raise FileNotFoundError(f"브랜드 CSV가 없습니다: {brand_path}")
+    if not list_path.is_file():
+        raise FileNotFoundError(f"목록 CSV가 없습니다: {list_path}")
+
+    legacy = _load_legacy_kiacar_module()
+    logger.info("🏁 기아 인증중고 enrich 시작")
+    logger.info("- brand_csv=%s", brand_path)
+    logger.info("- list_csv=%s", list_path)
+    legacy.enrich_kiacar_list_with_brand(RESULT_DIR, logger)
+
+    return {
+        "brand_csv": str(brand_path),
+        "list_csv": str(list_path),
+        "count": _count_csv_rows(list_path),
+        "log_dir": str(LOG_DIR),
+        "img_base": str(IMG_BASE),
+    }
+
+
+kiacar_dag = kiacar_crawler_dag()
+
+
+def main():
+    activate_paths_for_datst(KIACAR_DATST_LIST)
+    infos = {
+        KIACAR_DATST_BRAND: {"datst_cd": KIACAR_DATST_BRAND},
+        KIACAR_DATST_LIST: {"datst_cd": KIACAR_DATST_LIST},
+        KIACAR_DATST_ENRICH: {"datst_cd": KIACAR_DATST_ENRICH},
+    }
+    brand_csv = _run_kiacar_brand_csv(str(infos[KIACAR_DATST_BRAND]["datst_cd"]))
+    list_csv = _run_kiacar_list_csv(str(infos[KIACAR_DATST_LIST]["datst_cd"]), brand_csv)
+    _run_kiacar_enrich_csv(str(infos[KIACAR_DATST_ENRICH]["datst_cd"]), brand_csv, list_csv)
+
+
+if __name__ == "__main__":
+    main()
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
 기아 인증중고(CPO) brand CSV ↔ list CSV 매칭(enrich) DAG.
 
 목적:
@@ -18,7 +380,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from airflow.decorators import dag, task
+from airflow.decorators import dag, task, task_group
 from pendulum import datetime as pd_datetime
 
 _root = Path(__file__).resolve().parent.parent
@@ -188,51 +550,4 @@ def kiacar_enrich_list_with_brand(logger: logging.Logger, brand_path: Path, list
     return {"matched": matched, "total": len(rows), "list_path": str(list_path)}
 
 
-def _latest_csv(dir_path: Path, prefix: str) -> Path | None:
-    if not dir_path.exists():
-        return None
-    files = sorted(dir_path.glob(f"{prefix}_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return files[0] if files else None
-
-
-@dag(
-    dag_id="sdag_kiacar_crawler",
-    schedule=None,
-    start_date=pd_datetime(2026, 1, 1, tz="Asia/Seoul"),
-    catchup=False,
-    tags=["usedcar", "kiacar", "enrich"],
-)
-def kiacar_enrich_dag():
-    @task
-    def prepare_environment() -> dict:
-        RESULT_DIR.mkdir(parents=True, exist_ok=True)
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        run_ts = datetime.now().strftime("%Y%m%d%H%M%S")
-        return {
-            "run_ts": run_ts,
-            "result_dir": str(RESULT_DIR),
-            "log_dir": str(LOG_DIR),
-        }
-
-    @task
-    def enrich_list(ctx: dict, brand_csv_path: str | None = None, list_csv_path: str | None = None) -> dict:
-        logger = _get_logger()
-        result_dir = Path(ctx["result_dir"])
-
-        brand_path = Path(brand_csv_path) if brand_csv_path else _latest_csv(result_dir, "kiacar_brand_list")
-        list_path = Path(list_csv_path) if list_csv_path else _latest_csv(result_dir, "kiacar_list")
-
-        if not brand_path or not list_path:
-            raise FileNotFoundError(
-                f"입력 CSV를 찾지 못했습니다. brand={brand_path}, list={list_path}, dir={result_dir}"
-            )
-
-        logger.info("enrich 입력: brand=%s list=%s", brand_path, list_path)
-        return kiacar_enrich_list_with_brand(logger, brand_path, list_path)
-
-    ctx = prepare_environment()
-    enrich_list(ctx)
-
-
-kiacar_dag = kiacar_enrich_dag()
 
