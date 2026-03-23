@@ -10,8 +10,7 @@ import csv
 import logging
 import os
 import sys
-from dataclasses import dataclass
-from datetime import date, datetime, time as dt_time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +25,9 @@ from playwright.sync_api import sync_playwright
 _root = Path(__file__).resolve().parent.parent
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
+
+from dto.tn_data_bsc_info import TnDataBscInfo
+from util.common_util import CommonUtil
 
 
 @dag(
@@ -68,15 +70,10 @@ def autoinside_crawler_dag():
                 out: dict[str, dict[str, Any]] = {}
                 for row in cur.fetchall() or []:
                     raw = dict(zip(cols, row))
-                    d: dict[str, Any] = {}
-                    for k, v in raw.items():
-                        if isinstance(v, (datetime, date, dt_time)):
-                            d[k] = v.isoformat()
-                        else:
-                            d[k] = v
-                    k = str(d.get("datst_cd") or "").lower().strip()
+                    dto = CommonUtil.build_bsc_info_dto(raw)
+                    k = str(dto.datst_cd or "").lower().strip()
                     if k and k not in out:
-                        out[k] = d
+                        out[k] = CommonUtil.bsc_info_to_dict(dto)
         finally:
             try:
                 conn.close()
@@ -99,40 +96,170 @@ def autoinside_crawler_dag():
         return out
 
     @task
-    def run_car_type_csv(infos: dict[str, dict[str, Any]]) -> str:
+    def run_car_type_csv(infos: dict[str, dict[str, Any]], **kwargs) -> str:
         dc = str((infos.get(AUTOINSIDE_DATST_CAR_TYPE) or {}).get("datst_cd") or AUTOINSIDE_DATST_CAR_TYPE).lower()
-        return _run_autoinside_car_type_csv(dc)
+        return _run_autoinside_car_type_csv(dc, kwargs=kwargs)
 
     @task
-    def run_brand_csv(infos: dict[str, dict[str, Any]]) -> str:
+    def run_brand_csv(infos: dict[str, dict[str, Any]], **kwargs) -> str:
         dc = str((infos.get(AUTOINSIDE_DATST_BRAND) or {}).get("datst_cd") or AUTOINSIDE_DATST_BRAND).lower()
-        return _run_autoinside_brand_csv(dc)
+        return _run_autoinside_brand_csv(dc, kwargs=kwargs)
 
     @task
     def run_list_csv(
         bsc_infos: dict[str, dict[str, Any]],
         brand_csv_path: str,
         car_type_csv_path: str,
+        **kwargs,
     ) -> dict[str, Any]:
-        bsc = BscInfo.from_row(bsc_infos[AUTOINSIDE_DATST_LIST])
+        tn_data_bsc_info = CommonUtil.build_bsc_info_dto(bsc_infos[AUTOINSIDE_DATST_LIST])
         return run_autoinside_list_job(
-            bsc,
+            tn_data_bsc_info,
             brand_list_csv_path=brand_csv_path,
             car_type_csv_path=car_type_csv_path or None,
+            kwargs=kwargs,
         )
+
+    @task
+    def register_csv_collect_log_info(
+        bsc_infos: dict[str, dict[str, Any]],
+        datst_cd: str,
+        csv_path: str,
+    ) -> dict[str, Any]:
+        hook = PostgresHook(postgres_conn_id="car_db_conn")
+        csv_file_path = Path(str(csv_path or ""))
+        if not csv_file_path.is_file():
+            raise FileNotFoundError(f"수집 메타 등록 대상 CSV가 없습니다: datst_cd={datst_cd}, path={csv_file_path}")
+
+        tn_data_bsc_info = CommonUtil.build_bsc_info_dto(bsc_infos[datst_cd])
+        tn_data_clct_dtl_info = CommonUtil.upsert_collect_detail_info(
+            hook,
+            AUTOINSIDE_COLLECT_DETAIL_TABLE,
+            tn_data_bsc_info.datst_cd,
+            csv_file_path,
+        )
+        registered_file_path = str(CommonUtil.build_collect_detail_file_path(tn_data_clct_dtl_info))
+        logging.info(
+            "오토인사이드 수집 메타 등록: datst_cd=%s, file=%s, clct_pnttm=%s, status=%s",
+            datst_cd,
+            registered_file_path,
+            tn_data_clct_dtl_info.clct_pnttm,
+            getattr(tn_data_clct_dtl_info, "status", ""),
+        )
+        tn_data_clct_dtl_info_dict = tn_data_clct_dtl_info.as_dict()
+        tn_data_clct_dtl_info_dict["file_path"] = registered_file_path
+        tn_data_clct_dtl_info_dict["status"] = getattr(tn_data_clct_dtl_info, "status", "")
+        return tn_data_clct_dtl_info_dict
+
+    @task
+    def load_csv_to_ods(
+        bsc_infos: dict[str, dict[str, Any]],
+        tn_data_clct_dtl_info_map: dict[str, dict[str, Any]],
+        datst_cd: str,
+    ) -> dict[str, Any]:
+        if datst_cd not in tn_data_clct_dtl_info_map:
+            raise ValueError(f"수집 메타 등록 결과가 없습니다: datst_cd={datst_cd}")
+
+        tn_data_bsc_info = CommonUtil.build_bsc_info_dto(bsc_infos[datst_cd])
+        hook = PostgresHook(postgres_conn_id="car_db_conn")
+        tn_data_clct_dtl_info = CommonUtil.get_latest_collect_detail_info(
+            hook,
+            AUTOINSIDE_COLLECT_DETAIL_TABLE,
+            datst_cd,
+        )
+        if not tn_data_clct_dtl_info:
+            raise ValueError(f"최신 수집 메타 정보가 없습니다: datst_cd={datst_cd}")
+
+        latest_csv_path = CommonUtil.build_collect_detail_file_path(tn_data_clct_dtl_info)
+
+        if not latest_csv_path.is_file():
+            raise ValueError(
+                f"CSV 수집 완료 조건 미충족: datst_cd={datst_cd}, exists={latest_csv_path.is_file()}, path={latest_csv_path}"
+            )
+
+        target_table = _resolve_target_table_for_datst(datst_cd, tn_data_bsc_info.ods_tbl_phys_nm)
+        logging.info(
+            "오토인사이드 최신 CSV 메타 선택: datst_cd=%s, selected=%s, clct_pnttm=%s, file_nm=%s",
+            datst_cd,
+            latest_csv_path,
+            tn_data_clct_dtl_info.clct_pnttm or "",
+            tn_data_clct_dtl_info.clct_data_file_nm or "",
+        )
+        rows = _read_csv_rows(latest_csv_path)
+        if not rows:
+            raise ValueError(f"적재할 CSV 데이터가 없습니다: datst_cd={datst_cd}, path={latest_csv_path}")
+        if datst_cd == AUTOINSIDE_DATST_LIST:
+            original_count = len(rows)
+            rows = _dedupe_autoinside_list_rows(rows)
+            if len(rows) != original_count:
+                logging.info(
+                    "오토인사이드 list 중복 제거: before=%d, after=%d, removed=%d",
+                    original_count,
+                    len(rows),
+                    original_count - len(rows),
+                )
+
+        _bulk_insert_rows(hook, target_table, rows, truncate=True, allow_only_table_cols=True)
+        table_count = CommonUtil.get_table_row_count(hook, target_table)
+        logging.info(
+            "오토인사이드 CSV 적재 완료: datst_cd=%s, table=%s, inserted_rows=%d, table_count=%d, csv=%s",
+            datst_cd,
+            target_table,
+            len(rows),
+            table_count,
+            latest_csv_path,
+        )
+        return {
+            "done": True,
+            "datst_cd": datst_cd,
+            "target_table": target_table,
+            "row_count": len(rows),
+            "table_count": table_count,
+            "csv_path": str(latest_csv_path),
+        }
 
     @task_group(group_id="create_csv_process")
     def create_csv_process(bsc_infos: dict[str, dict[str, Any]]) -> dict[str, Any]:
         car_type_path = run_car_type_csv(bsc_infos)
+        car_type_collect_info = register_csv_collect_log_info.override(
+            task_id="register_car_type_collect_log_info"
+        )(bsc_infos, AUTOINSIDE_DATST_CAR_TYPE, car_type_path)
+
         brand_path = run_brand_csv(bsc_infos)
-        return run_list_csv(bsc_infos, brand_path, car_type_path)
+        brand_collect_info = register_csv_collect_log_info.override(
+            task_id="register_brand_collect_log_info"
+        )(bsc_infos, AUTOINSIDE_DATST_BRAND, brand_path)
+
+        list_result = run_list_csv(bsc_infos, brand_path, car_type_path)
+        list_collect_info = register_csv_collect_log_info.override(
+            task_id="register_list_collect_log_info"
+        )(bsc_infos, AUTOINSIDE_DATST_LIST, list_result["list_csv"])
+
+        return {
+            AUTOINSIDE_DATST_BRAND: brand_collect_info,
+            AUTOINSIDE_DATST_CAR_TYPE: car_type_collect_info,
+            AUTOINSIDE_DATST_LIST: list_collect_info,
+        }
+
+    @task_group(group_id="insert_csv_process")
+    def insert_csv_process(
+        bsc_infos: dict[str, dict[str, Any]],
+        tn_data_clct_dtl_info_map: dict[str, dict[str, Any]],
+    ) -> None:
+        load_csv_to_ods.override(task_id="load_brand_csv_to_ods")(bsc_infos, tn_data_clct_dtl_info_map, AUTOINSIDE_DATST_BRAND)
+        load_csv_to_ods.override(task_id="load_car_type_csv_to_ods")(bsc_infos, tn_data_clct_dtl_info_map, AUTOINSIDE_DATST_CAR_TYPE)
+        load_csv_to_ods.override(task_id="load_list_csv_to_ods")(bsc_infos, tn_data_clct_dtl_info_map, AUTOINSIDE_DATST_LIST)
 
     infos = insert_collect_data_info()
-    create_csv_process(infos)
+    tn_data_clct_dtl_info_map = create_csv_process(infos)
+    insert_csv_process(infos, tn_data_clct_dtl_info_map)
 
 # Airflow Variable (기존 크롤러 DAG와 동일)
 USED_CAR_SITE_NAMES_VAR = "used_car_site_names"
 CRAWL_BASE_PATH_VAR = "crawl_base_path"
+FINAL_FILE_PATH_VAR = "used_car_final_file_path"
+COLLECT_LOG_FILE_PATH_VAR = "used_car_collect_log_file_path"
+IMAGE_FILE_PATH_VAR = "used_car_image_file_path"
 
 # DB `std.tn_data_bsc_info`: 오토인사이드 제공사이트 코드
 AUTOINSIDE_PVSN_SITE_CD = "ps00001"
@@ -140,27 +267,113 @@ AUTOINSIDE_DATST_BRAND = "data1"
 AUTOINSIDE_DATST_CAR_TYPE = "data2"
 AUTOINSIDE_DATST_LIST = "data3"
 AUTOINSIDE_SITE_NAME = "오토인사이드"
+AUTOINSIDE_BRAND_TABLE = "ods.ods_brand_list_autoinside"
+AUTOINSIDE_CAR_TYPE_TABLE = "ods.ods_car_type_list_autoinside"
+AUTOINSIDE_LIST_TABLE = "ods.ods_tmp_car_list_autoinside"
+AUTOINSIDE_TMP_LIST_TABLE = "ods.ods_tmp_car_list_autoinside"
+AUTOINSIDE_COLLECT_DETAIL_TABLE = "std.tn_data_clct_dtl_info"
 
 
-def _get_crawl_base_path() -> Path:
+def _get_context_var_value(kwargs: dict[str, Any] | None, var_name: str) -> Any:
+    if not kwargs:
+        return None
     try:
-        v = Variable.get(CRAWL_BASE_PATH_VAR, default_var=None)
-        if v:
-            return Path(str(v).strip())
+        var_ctx = kwargs.get("var")
+        if isinstance(var_ctx, dict):
+            accessor = var_ctx.get("value")
+            if isinstance(accessor, dict):
+                return accessor.get(var_name)
+            if accessor is not None:
+                return getattr(accessor, var_name, None)
+        if var_ctx is not None:
+            accessor = getattr(var_ctx, "value", None)
+            if accessor is not None:
+                return getattr(accessor, var_name, None)
+    except Exception:
+        return None
+    return None
+
+
+def _get_context_var_json(kwargs: dict[str, Any] | None, var_name: str) -> Any:
+    if not kwargs:
+        return None
+    try:
+        var_ctx = kwargs.get("var")
+        if isinstance(var_ctx, dict):
+            accessor = var_ctx.get("json")
+            if isinstance(accessor, dict):
+                return accessor.get(var_name)
+            if accessor is not None:
+                return getattr(accessor, var_name, None)
+        if var_ctx is not None:
+            accessor = getattr(var_ctx, "json", None)
+            if accessor is not None:
+                return getattr(accessor, var_name, None)
+    except Exception:
+        return None
+    return None
+
+
+def _get_variable_path(var_name: str, kwargs: dict[str, Any] | None = None) -> Path | None:
+    ctx_value = _get_context_var_value(kwargs, var_name)
+    if ctx_value and str(ctx_value).strip():
+        return Path(str(ctx_value).strip())
+    try:
+        value = Variable.get(var_name, default_var=None)
+        if value and str(value).strip():
+            return Path(str(value).strip())
     except Exception:
         pass
-    return Path(Variable.get("HEYDEALER_BASE_PATH", "/home/limhayoung/data"))
+    return None
 
 
-def get_site_name_by_datst(datst_cd: str) -> str:
+def _get_crawl_base_path(kwargs: dict[str, Any] | None = None) -> Path:
+    base = _get_variable_path(CRAWL_BASE_PATH_VAR, kwargs=kwargs)
+    if base is not None:
+        return base
+
+    legacy = _get_variable_path("HEYDEALER_BASE_PATH", kwargs=kwargs)
+    if legacy is not None:
+        return legacy
+    return Path("/home/limhayoung/data")
+
+
+def _get_result_root_path(kwargs: dict[str, Any] | None = None) -> Path:
+    direct = _get_variable_path(FINAL_FILE_PATH_VAR, kwargs=kwargs)
+    if direct is not None:
+        return direct
+    return _get_crawl_base_path(kwargs=kwargs) / "crawl"
+
+
+def _get_log_root_path(kwargs: dict[str, Any] | None = None) -> Path:
+    direct = _get_variable_path(COLLECT_LOG_FILE_PATH_VAR, kwargs=kwargs)
+    if direct is not None:
+        return direct
+    return _get_crawl_base_path(kwargs=kwargs) / "log"
+
+
+def _get_img_root_path(kwargs: dict[str, Any] | None = None) -> Path:
+    direct = _get_variable_path(IMAGE_FILE_PATH_VAR, kwargs=kwargs)
+    if direct is not None:
+        return direct
+
+    result_root = _get_result_root_path(kwargs=kwargs)
+    if result_root.name.lower() == "crawl":
+        return result_root.parent / "img"
+    return _get_crawl_base_path(kwargs=kwargs) / "img"
+
+
+def get_site_name_by_datst(datst_cd: str, kwargs: dict[str, Any] | None = None) -> str:
     key = (datst_cd or "").lower().strip()
     mapping: dict[str, Any] = {}
+    raw = _get_context_var_json(kwargs, USED_CAR_SITE_NAMES_VAR)
     try:
-        raw = Variable.get(
-            USED_CAR_SITE_NAMES_VAR,
-            default_var="{}",
-            deserialize_json=True,
-        )
+        if raw is None:
+            raw = Variable.get(
+                USED_CAR_SITE_NAMES_VAR,
+                default_var="{}",
+                deserialize_json=True,
+            )
         if isinstance(raw, dict):
             mapping = {str(k).lower(): v for k, v in raw.items()}
     except Exception:
@@ -171,63 +384,150 @@ def get_site_name_by_datst(datst_cd: str) -> str:
     return AUTOINSIDE_SITE_NAME
 
 
-def get_autoinside_site_name() -> str:
+def get_autoinside_site_name(kwargs: dict[str, Any] | None = None) -> str:
     for datst_cd in (
         AUTOINSIDE_DATST_LIST,
         AUTOINSIDE_DATST_BRAND,
         AUTOINSIDE_DATST_CAR_TYPE,
     ):
-        site_name = get_site_name_by_datst(datst_cd)
+        site_name = get_site_name_by_datst(datst_cd, kwargs=kwargs)
         if site_name and site_name.strip():
             return site_name
     return AUTOINSIDE_SITE_NAME
 
 
-@dataclass(frozen=True)
-class BscInfo:
-    pvsn_site_cd: str
-    datst_cd: str
-    dtst_nm: str
-    link_url: str
-    clct_yn: str
-    link_yn: str
-    incr_yn: str
-    clct_mthd: str
-    target_table: str | None = None
-
-    @staticmethod
-    def from_row(row: dict[str, Any]) -> "BscInfo":
-        def _s(k: str) -> str:
-            v = row.get(k)
-            return "" if v is None else str(v)
-
-        return BscInfo(
-            pvsn_site_cd=_s("pvsn_site_cd"),
-            datst_cd=_s("datst_cd"),
-            dtst_nm=_s("dtst_nm"),
-            link_url=_s("link_url") or _s("link_data_clct_url"),
-            clct_yn=_s("clct_yn"),
-            link_yn=_s("link_yn"),
-            incr_yn=_s("incr_yn"),
-            clct_mthd=_s("clct_mthd"),
-            target_table=(row.get("target_table") or row.get("trgt_tbl_nm") or row.get("target_tbl"))
-            and str(row.get("target_table") or row.get("trgt_tbl_nm") or row.get("target_tbl")),
-        )
+def _normalize_target_table(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    s = str(raw).strip()
+    s = s.strip('"').strip("'").strip()
+    s = s.replace('"ods."', "ods.").replace("'ods.'", "ods.")
+    s = s.replace('"', "").replace("'", "").strip()
+    if not s:
+        return None
+    if "." not in s:
+        return s
+    parts = [p for p in s.split(".") if p]
+    if len(parts) >= 2:
+        return parts[0] + "." + parts[1]
+    return s
 
 
-def activate_paths_for_datst(datst_cd: str) -> None:
+def _resolve_target_table_for_datst(datst_cd: str, raw: str | None) -> str:
+    normalized = _normalize_target_table(raw)
+    key = (datst_cd or "").lower().strip()
+
+    if key == AUTOINSIDE_DATST_BRAND:
+        return normalized or AUTOINSIDE_BRAND_TABLE
+    if key == AUTOINSIDE_DATST_CAR_TYPE:
+        return normalized or AUTOINSIDE_CAR_TYPE_TABLE
+    if key == AUTOINSIDE_DATST_LIST:
+        return normalized or AUTOINSIDE_LIST_TABLE
+    if normalized:
+        return normalized
+    raise ValueError(f"적재 대상 테이블을 확인할 수 없습니다: datst_cd={datst_cd}")
+
+
+def _dedupe_autoinside_list_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen_product_ids: set[str] = set()
+    for row in rows:
+        product_id = str(row.get("product_id") or "").strip()
+        if product_id:
+            if product_id in seen_product_ids:
+                continue
+            seen_product_ids.add(product_id)
+        deduped.append(row)
+    return deduped
+
+
+def _read_csv_rows(csv_path: Path) -> list[dict[str, Any]]:
+    if not csv_path.exists():
+        return []
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        return [dict(r) for r in csv.DictReader(f)]
+
+
+def _split_schema_table(full_name: str) -> tuple[str, str]:
+    if "." in full_name:
+        schema, table = full_name.split(".", 1)
+        return schema.strip(), table.strip()
+    return "public", full_name.strip()
+
+
+def _get_table_columns(hook: PostgresHook, full_table_name: str) -> list[str]:
+    schema, table = _split_schema_table(full_table_name)
+    sql = """
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = %s
+      AND table_name = %s
+    ORDER BY ordinal_position
+    """
+    rows = hook.get_records(sql, parameters=(schema, table))
+    return [r[0] for r in rows]
+
+
+def _bulk_insert_rows(
+    hook: PostgresHook,
+    full_table_name: str,
+    rows: list[dict[str, Any]],
+    *,
+    truncate: bool = False,
+    allow_only_table_cols: bool = True,
+) -> None:
+    if not rows:
+        return
+
+    table_cols = _get_table_columns(hook, full_table_name) if allow_only_table_cols else []
+    table_col_set = set(table_cols)
+
+    candidate_cols: list[str] = []
+    for row in rows:
+        for key in row.keys():
+            if key not in candidate_cols:
+                candidate_cols.append(key)
+
+    insert_cols = [c for c in candidate_cols if c in table_col_set] if table_cols else candidate_cols
+    if not insert_cols:
+        raise ValueError(f"insert 가능한 컬럼이 없습니다. table={full_table_name}")
+
+    values = [tuple(row.get(col) for col in insert_cols) for row in rows]
+
+    conn = hook.get_conn()
+    try:
+        with conn.cursor() as cur:
+            if truncate:
+                cur.execute(f"TRUNCATE TABLE {full_table_name}")
+
+            from psycopg2.extras import execute_values
+
+            cols_sql = ", ".join([f'"{col}"' for col in insert_cols])
+            sql = f"INSERT INTO {full_table_name} ({cols_sql}) VALUES %s"
+            execute_values(cur, sql, values, page_size=2000)
+        conn.commit()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def activate_paths_for_datst(datst_cd: str, kwargs: dict[str, Any] | None = None) -> None:
     global RESULT_DIR, LOG_DIR, IMG_BASE, YEAR_STR, DATE_STR, RUN_TS
 
-    base = _get_crawl_base_path()
-    site = get_autoinside_site_name()
+    result_root = _get_result_root_path(kwargs=kwargs)
+    log_root = _get_log_root_path(kwargs=kwargs)
+    img_root = _get_img_root_path(kwargs=kwargs)
+    site = get_autoinside_site_name(kwargs=kwargs)
     now = datetime.now()
     YEAR_STR = now.strftime("%Y년")
     DATE_STR = now.strftime("%Y%m%d")
     RUN_TS = now.strftime("%Y%m%d%H%M")
 
-    RESULT_DIR = base / "crawl" / YEAR_STR / site / DATE_STR
-    LOG_DIR = base / "log" / YEAR_STR / site / DATE_STR
-    IMG_BASE = base / "img" / YEAR_STR / site / DATE_STR
+    RESULT_DIR = CommonUtil.build_dated_site_path(result_root, site, now)
+    LOG_DIR = CommonUtil.build_dated_site_path(log_root, site, now)
+    IMG_BASE = CommonUtil.build_dated_site_path(img_root, site, now)
 
 
 YEAR_STR = ""
@@ -1153,6 +1453,7 @@ def run_autoinside_list_by_car_type(
     brand_nm_map = load_brand_nm_mapping(result_dir, brand_path=brand_path)
 
     car_type_names = ["경소형", "준중형", "중형", "대형", "SUV/RV", "스포츠", "승합", "트럭"]
+    seen_product_id_to_type: dict[str, str] = {}
 
     try:
         logger.info("오토인사이드 차종별 목록(list) 수집 시작: %s", URL)
@@ -1176,7 +1477,7 @@ def run_autoinside_list_by_car_type(
             for car_type_name in car_type_names:
                 # 차종 카테고리 버튼 클릭
                 try:
-                    btn = page.locator(f"text={car_type_name}").first
+                    btn = page.get_by_text(car_type_name, exact=True).first
                     btn.click()
                     page.wait_for_timeout(2000)
                     logger.info("[차종] '%s' 선택 후 목록 수집 시작", car_type_name)
@@ -1252,7 +1553,17 @@ def run_autoinside_list_by_car_type(
                     if not product_id and not nm_val:
                         continue
 
+                    if product_id and product_id in seen_product_id_to_type:
+                        logger.info(
+                            "[차종] 중복 product_id 스킵: current=%s, previous=%s, product_id=%s",
+                            car_type_name,
+                            seen_product_id_to_type[product_id],
+                            product_id,
+                        )
+                        continue
+
                     if product_id:
+                        seen_product_id_to_type[product_id] = car_type_name
                         product_ids_for_images.append(product_id)
                     collected += 1
 
@@ -1320,8 +1631,8 @@ def run_autoinside_list_by_car_type(
         logger.error("차종별 목록(list_by_car_type) 수집 오류: %s", e, exc_info=True)
 
 
-def _run_autoinside_car_type_csv(datst_cd: str) -> str:
-    activate_paths_for_datst((datst_cd or AUTOINSIDE_DATST_CAR_TYPE).lower() or AUTOINSIDE_DATST_CAR_TYPE)
+def _run_autoinside_car_type_csv(datst_cd: str, kwargs: dict[str, Any] | None = None) -> str:
+    activate_paths_for_datst((datst_cd or AUTOINSIDE_DATST_CAR_TYPE).lower() or AUTOINSIDE_DATST_CAR_TYPE, kwargs=kwargs)
     run_ts = datetime.now().strftime("%Y%m%d%H%M")
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1337,8 +1648,8 @@ def _run_autoinside_car_type_csv(datst_cd: str) -> str:
     return str(car_type_csv)
 
 
-def _run_autoinside_brand_csv(datst_cd: str) -> str:
-    activate_paths_for_datst((datst_cd or AUTOINSIDE_DATST_BRAND).lower() or AUTOINSIDE_DATST_BRAND)
+def _run_autoinside_brand_csv(datst_cd: str, kwargs: dict[str, Any] | None = None) -> str:
+    activate_paths_for_datst((datst_cd or AUTOINSIDE_DATST_BRAND).lower() or AUTOINSIDE_DATST_BRAND, kwargs=kwargs)
     run_ts = datetime.now().strftime("%Y%m%d%H%M")
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1358,12 +1669,13 @@ def _run_autoinside_brand_csv(datst_cd: str) -> str:
 
 
 def run_autoinside_list_job(
-    bsc: BscInfo,
+    bsc: TnDataBscInfo,
     *,
     brand_list_csv_path: str,
     car_type_csv_path: str | None = None,
+    kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    activate_paths_for_datst((bsc.datst_cd or AUTOINSIDE_DATST_LIST).lower() or AUTOINSIDE_DATST_LIST)
+    activate_paths_for_datst((bsc.datst_cd or AUTOINSIDE_DATST_LIST).lower() or AUTOINSIDE_DATST_LIST, kwargs=kwargs)
     run_ts = datetime.now().strftime("%Y%m%d%H%M")
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1379,8 +1691,8 @@ def run_autoinside_list_job(
         logger.warning("차종 CSV 경로 없음(무시하고 진행): %s", car_type_csv_path)
 
     logger.info("🏁 오토인사이드 목록 수집 시작")
-    logger.info("- pvsn_site_cd=%s, datst_cd=%s, dtst_nm=%s", bsc.pvsn_site_cd, bsc.datst_cd, bsc.dtst_nm)
-    logger.info("- link_url=%s", bsc.link_url)
+    logger.info("- pvsn_site_cd=%s, datst_cd=%s, datst_nm=%s", bsc.pvsn_site_cd, bsc.datst_cd, bsc.datst_nm)
+    logger.info("- link_url=%s", bsc.link_data_clct_url)
     logger.info("- 브랜드 CSV(이전 태스크): %s", brand_path)
 
     list_path = RESULT_DIR / f"autoinside_list_{run_ts}.csv"
@@ -1413,38 +1725,24 @@ def run_autoinside_list_job(
         "car_type_csv": car_type_csv_path or "",
         "list_csv": str(list_path),
         "count": count,
+        "done": list_path.is_file() and count > 0,
         "log_dir": str(LOG_DIR),
         "img_base": str(IMG_BASE),
     }
 
 
-autoinside_dag = autoinside_crawler_dag()
+dag_object = autoinside_crawler_dag()
 
 
-def main():
-    activate_paths_for_datst(AUTOINSIDE_DATST_LIST)
-    result_dir = RESULT_DIR
-    # 브랜드 수집은 Chrome 창 띄워서 클릭하는 방식으로 동작 (제조사 전환 시 목록 갱신 안정화)
-    headless = not USE_HEADED_FOR_BRAND
-    with sync_playwright() as p:
-        browser = _launch_browser(p, headless, prefer_chrome=USE_HEADED_FOR_BRAND)
-        try:
-            page = browser.new_page()
-            # [테스트] list.csv + 이미지만 수행 (차종/브랜드 목록 수집 생략)
-            # logger_ct = setup_logger("car_type_list")
-            # run_autoinside_car_type_list(page, result_dir, logger_ct)
-            # logger_br = setup_logger("brand_list")
-            # if USE_AJAX_FOR_BRAND:
-            #     run_autoinside_brand_list_via_ajax(result_dir, logger_br)
-            # else:
-            #     run_autoinside_brand_list(page, result_dir, logger_br)
-
-            logger_list = setup_logger("list")
-            # list.csv 전체 목록 수집 + car_imgs 컬럼(이미지 경로) append + list 목록 이미지 저장
-            run_autoinside_list_by_car_type(page, result_dir, logger_list, max_per_type=None)
-        finally:
-            browser.close()
-
-
+# only run if the module is the main program
 if __name__ == "__main__":
-    main()
+    conn_path = "../connections_minio_pg.yaml"
+    # variables_path = "../variables.yaml"
+    dtst_cd = ""
+
+    dag_object.test(
+        execution_date=datetime(2025, 10, 10, 8, 0),
+        conn_file_path=conn_path,
+        # variable_file_path=variables_path,
+        # run_conf={"dtst_cd": dtst_cd},
+    )
