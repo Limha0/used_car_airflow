@@ -8,14 +8,122 @@ from dataclasses import dataclass
 from datetime import datetime, date, time as dt_time
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import pendulum
 import requests
-from airflow.decorators import dag, task
+from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from playwright.sync_api import sync_playwright
+
+
+@dag(
+    dag_id="sdag_heydealer_crawler",
+    schedule="@daily",
+    start_date=pendulum.datetime(2026, 3, 1, tz="Asia/Seoul"),
+    catchup=False,
+    render_template_as_native_obj=True,
+    tags=["heydealer", "crawler", "day"],
+)
+def heydealer_crawler():
+    """
+    헤이딜러(중고차) 브랜드/차종/목록 수집 DAG.
+
+    - DB 메타(std.tn_data_bsc_info, ps00002 data4/5/6) 조회
+    - 브랜드/차종은 API로 CSV 생성
+    - 목록은 playwright로 사이트 크롤링 후 CSV/이미지 저장
+    """
+
+    # PostgresHook 객체 생성
+    pg_hook = PostgresHook(postgres_conn_id="car_db_conn")
+
+    @task
+    def insert_collect_data_info(**kwargs) -> dict[str, dict[str, Any]]:
+        """std.tn_data_bsc_info에서 헤이딜러(ps00002) 수집 대상 기본 정보 조회."""
+        select_bsc_info_stmt = f"""
+        SELECT * FROM std.tn_data_bsc_info tdbi
+        WHERE 1=1
+          AND LOWER(clct_yn) = 'y'
+          AND LOWER(link_yn) = 'y'
+          AND LOWER(pvsn_site_cd) = '{HEYDEALER_PVSN_SITE_CD}'
+          AND LOWER(datst_cd) IN ('{HEYDEALER_DATST_BRAND}','{HEYDEALER_DATST_CAR_TYPE}','{HEYDEALER_DATST_LIST}')
+        ORDER BY data_sn
+        """
+        logging.info("select_bsc_info_stmt ::: %s", select_bsc_info_stmt)
+        conn = pg_hook.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(select_bsc_info_stmt)
+                cols = [d[0] for d in cur.description]
+                out: dict[str, dict[str, Any]] = {}
+                for row in cur.fetchall() or []:
+                    raw = dict(zip(cols, row))
+                    d: dict[str, Any] = {}
+                    for k, v in raw.items():
+                        if isinstance(v, (datetime, date, dt_time)):
+                            d[k] = v.isoformat()
+                        else:
+                            d[k] = v
+                    k = str(d.get("datst_cd") or "").lower().strip()
+                    if k and k not in out:
+                        out[k] = d
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        missing = [
+            k
+            for k in (
+                HEYDEALER_DATST_BRAND,
+                HEYDEALER_DATST_CAR_TYPE,
+                HEYDEALER_DATST_LIST,
+            )
+            if k not in out
+        ]
+        if missing:
+            raise ValueError(
+                f"std.tn_data_bsc_info 조회 결과 누락: {missing} (pvsn_site_cd={HEYDEALER_PVSN_SITE_CD})"
+            )
+        return out
+
+    @task
+    def run_brand_csv(infos: dict[str, dict[str, Any]]) -> str:
+        """[STEP1] 헤이딜러 브랜드 CSV 생성."""
+        dc = str((infos.get(HEYDEALER_DATST_BRAND) or {}).get("datst_cd") or HEYDEALER_DATST_BRAND).lower()
+        return _run_heydealer_brand_csv(dc)
+
+    @task
+    def run_car_type_csv(infos: dict[str, dict[str, Any]]) -> str:
+        """[STEP2] 헤이딜러 차종 CSV 생성."""
+        dc = str((infos.get(HEYDEALER_DATST_CAR_TYPE) or {}).get("datst_cd") or HEYDEALER_DATST_CAR_TYPE).lower()
+        return _run_heydealer_car_type_csv(dc)
+
+    @task
+    def run_list_csv(
+        bsc_infos: dict[str, dict[str, Any]],
+        brand_csv_path: str,
+        car_type_csv_path: str,
+    ) -> dict[str, Any]:
+        """[STEP3] 헤이딜러 목록/이미지 수집 후 list CSV 생성."""
+        b6 = BscInfo.from_row(bsc_infos[HEYDEALER_DATST_LIST])
+        return run_heydealer_job(
+            b6,
+            brand_list_csv_path=brand_csv_path,
+            car_type_csv_path=car_type_csv_path,
+        )
+
+    @task_group(group_id="create_csv_process")
+    def create_csv_process(bsc_infos: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        """브랜드/차종/목록 CSV 생성 그룹."""
+        brand_path = run_brand_csv(bsc_infos)
+        car_type_path = run_car_type_csv(bsc_infos)
+        return run_list_csv(bsc_infos, brand_path, car_type_path)
+
+    infos = insert_collect_data_info()
+    create_csv_process(infos)
 
 
 # Airflow Variable 키
@@ -141,20 +249,38 @@ def activate_paths_for_datst(datst_cd: str) -> None:
     )
 
 
-def _base_url_from_link(link_url: str) -> str:
-    u = urlparse(link_url)
-    if u.scheme and u.netloc:
-        # path까지 포함해서 반환 (예: https://www.heydealer.com/market/cars)
-        return f"{u.scheme}://{u.netloc}{u.path}"
-    return "https://www.heydealer.com"
+def _normalize_heydealer_list_url(link_url: str) -> str:
+    """기본 목록 URL을 정규화한다. 쿼리는 path 앞이 아니라 URL query 위치에 유지된다."""
+    raw = (link_url or "").strip() or "https://www.heydealer.com/market/cars"
+    parsed = urlparse(raw)
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc or "www.heydealer.com"
+    path = parsed.path or "/market/cars"
+    query = urlencode(parse_qsl(parsed.query, keep_blank_values=True), doseq=True)
+    return urlunparse((scheme, netloc, path, "", query, parsed.fragment))
 
 
-def _origin_from_link(link_url: str) -> str:
-    """스키마+호스트만 반환 (예: https://www.heydealer.com)."""
-    u = urlparse(link_url)
-    if u.scheme and u.netloc:
-        return f"{u.scheme}://{u.netloc}"
-    return "https://www.heydealer.com"
+def _build_heydealer_list_url(link_url: str, *, car_shape: str | None = None) -> str:
+    """
+    헤이딜러 목록 URL 생성.
+    - 기본 목록은 `link_url`의 path/query/fragment를 유지
+    - 차종 필터(`car-shape`)는 루트(`/`) query에 반영
+    """
+    base_url = _normalize_heydealer_list_url(link_url)
+    parsed = urlparse(base_url)
+
+    if car_shape:
+        path = "/"
+        fragment = ""
+    else:
+        path = parsed.path or "/market/cars"
+        fragment = parsed.fragment
+
+    query_pairs = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k != "car-shape"]
+    if car_shape:
+        query_pairs.append(("car-shape", str(car_shape)))
+    query = urlencode(query_pairs, doseq=True)
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", query, fragment))
 
 
 def _normalize_target_table(raw: str | None) -> str | None:
@@ -273,6 +399,11 @@ def _bulk_insert_rows(
 TARGET_COUNT = None
 
 BASE_DIR = Path(__file__).resolve().parent
+
+HEYDEALER_PVSN_SITE_CD = "ps00002"
+HEYDEALER_DATST_BRAND = "data4"
+HEYDEALER_DATST_CAR_TYPE = "data5"
+HEYDEALER_DATST_LIST = "data6"
 
 # 경로/파일명은 USED_CAR_SITE_NAMES JSON + datst_cd 로 결정 → activate_paths_for_datst() 에서 설정
 # (DAG import 시 한 번 기본 호출; 각 Task 에서도 datst_cd 마다 재호출)
@@ -666,7 +797,9 @@ def _csv_cell_excel_text(val):
 
 
 def save_to_csv_append(file_path, fieldnames, data_dict):
-    file_exists = Path(file_path).exists()
+    file_path = Path(file_path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = file_path.exists()
     # 셀 값 중 Excel 날짜로 해석될 수 있는 형태 보정
     row = {k: _csv_cell_excel_text(v) if isinstance(v, str) or v is None else v for k, v in data_dict.items()}
     with open(file_path, "a", newline="", encoding="utf-8-sig") as f:
@@ -1032,9 +1165,7 @@ def run_heydealer_job(
         car_type_entries = [(0, "")]
         run_logger.warning("filters API 실패 → 필터 없이 전체만 수집합니다.")
 
-    list_url = (bsc.link_url or "").strip() or "https://www.heydealer.com/market/cars"
-    base_url = _base_url_from_link(list_url)
-    site_origin = _origin_from_link(list_url)
+    list_url = _build_heydealer_list_url(bsc.link_url)
 
     run_logger.info("[1단계] 목록 수집 (playwright)")
     raw_list: list[dict[str, Any]] = []
@@ -1078,10 +1209,12 @@ def run_heydealer_job(
             no_new_rounds = 0
 
             if car_type_value:
-                v = quote(str(car_type_value), safe="")
                 # 중요: 헤이딜러 차체 필터는 /market/cars가 아닌 루트 경로 쿼리로 적용됨
                 # 예) https://www.heydealer.com/?car-shape=small
-                list_url_with_filter = f"{site_origin}/?car-shape={v}"
+                list_url_with_filter = _build_heydealer_list_url(
+                    bsc.link_url,
+                    car_shape=str(car_type_value),
+                )
                 try:
                     page.goto(list_url_with_filter, wait_until="domcontentloaded", timeout=60000)
                     page.wait_for_load_state("load", timeout=15000)
@@ -1308,117 +1441,16 @@ def _sync_tmp_and_source_register_flag(
             pass
 
 
-@dag(
-    dag_id="sdag_heydealer_crawler",
-    schedule="@daily",
-    start_date=pendulum.datetime(2026, 3, 1, tz="Asia/Seoul"),
-    catchup=False,
-    render_template_as_native_obj=True,
-    tags=["heydealer", "crawler", "day"],
-)
-def heydealer_crawler():
-    """
-    헤이딜러(중고차) 브랜드/차종/목록 수집 DAG.
+def _run_heydealer_brand_csv(datst_cd: str) -> str:
+    activate_paths_for_datst((datst_cd or HEYDEALER_DATST_BRAND).lower() or HEYDEALER_DATST_BRAND)
+    fetch_and_save_brand_csv()
+    return str(BRAND_LIST_FILE)
 
-    - DB 메타(std.tn_data_bsc_info, ps00002 data4/5/6) 조회
-    - 브랜드/차종은 API로 CSV 생성
-    - 목록은 playwright로 사이트 크롤링 후 CSV/이미지 저장
-    """
 
-    # PostgresHook (향후 DB 적재/로그용, 현재는 메타 조회에서 사용)
-    # pg_hook = PostgresHook(postgres_conn_id="car_db_conn")
-
-    @task
-    def insert_collect_data_info() -> dict[str, dict[str, Any]]:
-        """
-        tn_data_bsc_info(std 스키마)에서 헤이딜러(data4/5/6) 수집 대상 기본 정보 조회.
-
-        - clct_yn = 'y'
-        - link_yn = 'y'
-        - pvsn_site_cd = 'ps00002' (헤이딜러)
-        - datst_cd IN ('data4','data5','data6')
-        """
-        hook = PostgresHook(postgres_conn_id="car_db_conn")
-        sql = """
-       select * from std.tn_data_bsc_info
-       WHERE 1=1
-         AND LOWER(clct_yn) = 'y'
-         AND LOWER(link_yn) = 'y'
-         AND LOWER(pvsn_site_cd) = 'ps00002'
-         AND LOWER(datst_cd) IN ('data4','data5','data6')
-       ORDER by data_sn
-        """
-        conn = hook.get_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(sql)
-                cols = [d[0] for d in cur.description]
-                out: dict[str, dict[str, Any]] = {}
-                for row in cur.fetchall() or []:
-                    raw = dict(zip(cols, row))
-                    # datetime 계열은 XCom 직렬화를 위해 문자열로 변환
-                    d: dict[str, Any] = {}
-                    for k, v in raw.items():
-                        if isinstance(v, (datetime, date, dt_time)):
-                            d[k] = v.isoformat()
-                        else:
-                            d[k] = v
-                    k = str(d.get("datst_cd") or "").lower().strip()
-                    if k and k not in out:
-                        out[k] = d
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-        missing = [k for k in ("data4", "data5", "data6") if k not in out]
-        if missing:
-            raise ValueError(f"std.tn_data_bsc_info 조회 결과 누락: {missing} (pvsn_site_cd=ps00002)")
-        return out
-
-    @task
-    def run_brand_csv(infos: dict[str, dict[str, Any]]) -> str:
-        """
-        [STEP1] 헤이딜러 브랜드 CSV 생성 (heydealer_brand_list.csv)
-        """
-        dc = str((infos.get("data4") or {}).get("datst_cd") or "data4").lower()
-        activate_paths_for_datst(dc)
-        fetch_and_save_brand_csv()
-        return str(BRAND_LIST_FILE)
-
-    @task
-    def run_car_type_csv(infos: dict[str, dict[str, Any]]) -> str:
-        """
-        [STEP2] 헤이딜러 차종 CSV 생성 (heydealer_car_type_list.csv)
-        """
-        dc = str((infos.get("data5") or {}).get("datst_cd") or "data5").lower()
-        activate_paths_for_datst(dc)
-        fetch_filters_and_save_car_type_list()
-        return str(CAR_TYPE_LIST_FILE)
-
-    @task
-    def run_list_csv(
-        bsc_infos: dict[str, dict[str, Any]],
-        brand_csv_path: str,
-        car_type_csv_path: str,
-    ) -> dict[str, Any]:
-        """
-        [STEP3] 헤이딜러 목록/이미지 수집 후 heydealer_list.csv 생성
-        - run_brand_csv / run_car_type_csv 가 끝난 뒤에만 실행 (인자로 XCom 의존)
-        """
-        b6 = BscInfo.from_row(bsc_infos["data6"])
-        return run_heydealer_job(
-            b6,
-            brand_list_csv_path=brand_csv_path,
-            car_type_csv_path=car_type_csv_path,
-        )
-
-    infos = insert_collect_data_info()
-    brand_path = run_brand_csv(infos)
-    car_type_path = run_car_type_csv(infos)
-    # 목록은 브랜드·차종 CSV 태스크 완료 후에만 실행 (TaskFlow XCom 의존)
-    list_ctx = run_list_csv(infos, brand_path, car_type_path)
+def _run_heydealer_car_type_csv(datst_cd: str) -> str:
+    activate_paths_for_datst((datst_cd or HEYDEALER_DATST_CAR_TYPE).lower() or HEYDEALER_DATST_CAR_TYPE)
+    fetch_filters_and_save_car_type_list()
+    return str(CAR_TYPE_LIST_FILE)
 
 
 dag_object = heydealer_crawler()

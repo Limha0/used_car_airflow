@@ -545,10 +545,12 @@ def run_lotterentacar_brand_list(page, result_dir: Path, logger, csv_path: Path 
     ]
     need_header = True
     model_sn = 0
+    rows_since_flush = 0
 
     def write_row(f, w, brand_list, car_list, model_list, model_list_1, model_list_2):
-        nonlocal model_sn, need_header
+        nonlocal model_sn, need_header, rows_since_flush
         model_sn += 1
+        rows_since_flush += 1
         now = datetime.now()
         row = {
             "model_sn": model_sn,
@@ -564,16 +566,18 @@ def run_lotterentacar_brand_list(page, result_dir: Path, logger, csv_path: Path 
             w.writeheader()
             need_header = False
         w.writerow(row)
-        f.flush()
+        if rows_since_flush >= 100:
+            f.flush()
+            rows_since_flush = 0
 
     try:
         logger.info("==================== 롯데렌터카 브랜드/차종/모델 목록 수집 시작 ====================")
         if URL not in (page.url or ""):
             page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(3000)
+        page.wait_for_timeout(1500)
         try:
             page.wait_for_selector(SELECTOR_MNFC_LI, timeout=15000)
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(500)
         except Exception as e:
             logger.warning("브랜드 영역(ul.select-type-checked.mnfc > li) 대기 실패: %s", e)
             return
@@ -601,8 +605,8 @@ def run_lotterentacar_brand_list(page, result_dir: Path, logger, csv_path: Path 
                         continue
                     logger.info("[브랜드 %d/%d] %s", i + 1, brand_count, brand_name)
                     # 브랜드 하위 차종 펼치기: 너무 오래 대기하지 않도록 타임아웃 축소
-                    _ensure_children_visible(page, brand_li, MODEL_CHILD_LI, logger, timeout_ms=5000)
-                    page.wait_for_timeout(300)
+                    _ensure_children_visible(page, brand_li, MODEL_CHILD_LI, logger, timeout_ms=2500)
+                    page.wait_for_timeout(150)
                 except Exception as e:
                     logger.debug("브랜드 %d 클릭/이름 실패: %s", i, e)
                     continue
@@ -620,8 +624,8 @@ def run_lotterentacar_brand_list(page, result_dir: Path, logger, csv_path: Path 
                         if not car_name:
                             continue
                         # 차종 클릭 후 직계 자식 dmodel(더 뉴아이오닉 5 등) 노출
-                        _ensure_children_visible(page, car_li, DMODEL_CHILD_LI, logger, timeout_ms=5000)
-                        page.wait_for_timeout(250)
+                        _ensure_children_visible(page, car_li, DMODEL_CHILD_LI, logger, timeout_ms=2500)
+                        page.wait_for_timeout(120)
 
                     except Exception as e:
                         logger.debug("차종 %d 클릭/이름 실패: %s", j, e)
@@ -643,8 +647,8 @@ def run_lotterentacar_brand_list(page, result_dir: Path, logger, csv_path: Path 
                         except Exception:
                             model_list_val = ""
                         # model_list(더 뉴아이오닉 5 등) 클릭 후 직계 자식 dmodel(model_list_1) 노출
-                        _ensure_children_visible(page, d1_li, DMODEL_CHILD_LI, logger, timeout_ms=4000)
-                        page.wait_for_timeout(200)
+                        _ensure_children_visible(page, d1_li, DMODEL_CHILD_LI, logger, timeout_ms=1800)
+                        page.wait_for_timeout(100)
                         d2_lis = d1_li.locator(DMODEL_CHILD_LI)
                         d2_count = d2_lis.count()
                         if d2_count == 0:
@@ -657,8 +661,8 @@ def run_lotterentacar_brand_list(page, result_dir: Path, logger, csv_path: Path 
                             except Exception:
                                 model_list_1_val = ""
                             # model_list_1(EV 2WD 등) 클릭 후 직계 자식 dmodel(model_list_2) 노출 (없을 수도 있음)
-                            _ensure_children_visible(page, d2_li, DMODEL_CHILD_LI, logger, timeout_ms=3000)
-                            page.wait_for_timeout(150)
+                            _ensure_children_visible(page, d2_li, DMODEL_CHILD_LI, logger, timeout_ms=1200)
+                            page.wait_for_timeout(80)
                             d3_lis = d2_li.locator(DMODEL_CHILD_LI)
                             d3_count = d3_lis.count()
                             if d3_count == 0:
@@ -675,10 +679,12 @@ def run_lotterentacar_brand_list(page, result_dir: Path, logger, csv_path: Path 
                 # 다음 브랜드로 가기 전 현재 브랜드 접기(같은 li 다시 클릭)
                 try:
                     page.locator(SELECTOR_MNFC_LI).nth(i).locator("label").first.click()
-                    page.wait_for_timeout(300)
+                    page.wait_for_timeout(100)
                 except Exception:
                     pass
 
+            if rows_since_flush > 0:
+                f.flush()
         logger.info("저장 완료: %s (총 %d건)", csv_path, model_sn)
     except Exception as e:
         logger.error("브랜드 목록 수집 오류: %s", e, exc_info=True)
@@ -883,7 +889,7 @@ def run_lotterentacar_list_via_ajax(result_dir: Path, logger, list_csv_path: Pat
                     logger.warning("[%s] recordsPromotionFiltered(%d)와 1페이지 수신 promotion 건수(%d) 불일치 → 수집 목표를 실제 수신 기준으로 조정", car_type_name or cd, records_promotion_filtered, promotion_received)
                     total_count = records_filtered + promotion_received
                     total_pages = math.ceil(total_count / per_page) if total_count else 1
-                logger.info("[%s] recordsFiltered=%d, recordsPromotionFiltered=%d, 총=%d, 총 %d페이지 (1페이지 수신 promotion %d건)", car_type_name or cd, records_filtered, records_promotion_filtered, total_count, total_pages, promotion_received)
+                logger.info("[%s] 수집 시작: 총 %d건 대상", car_type_name or cd, total_count)
 
                 def _item_to_row(it, car_type_val):
                     product_id = (it.get("carId") or "")
@@ -966,10 +972,7 @@ def run_lotterentacar_list_via_ajax(result_dir: Path, logger, list_csv_path: Pat
                         w.writerow(row)
                         f.flush()
                     got = (len(promotion_list) if page_no == 1 else 0) + len(data_list)
-                    promo_cnt = len(promotion_list) if page_no == 1 else 0
-                    data_cnt = len(data_list)
-                    page_total = promo_cnt + data_cnt
-                    logger.info("[%s] page=%d 프로모션 %d건, data %d건 → 당페이지 %d건 (누적 %d/%d)", car_type_val, page_no, promo_cnt, data_cnt, page_total, collected_this_type, total_count)
+                    logger.info("[%s] 수집 진행: %d/%d", car_type_val, collected_this_type, total_count)
                     if collected_this_type >= total_count:
                         break
                     if got == 0:
