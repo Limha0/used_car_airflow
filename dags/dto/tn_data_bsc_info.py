@@ -19,6 +19,7 @@ class TnDataBscInfo(Base):
     clct_yn = Column(String)
     ods_load_yn = Column(String)
     ods_load_mth_cd = Column(String)
+    tmpr_tbl_phys_nm = Column(String)
     ods_tbl_phys_nm = Column(String)
     rmrk = Column(String)
     crt_id = Column(String)

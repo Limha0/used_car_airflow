@@ -33,6 +33,10 @@ class CommonUtil:
             target_table = serialized.get("ods_tbl_phys_nm") or serialized.get("target_table") or serialized.get("trgt_tbl_nm") or serialized.get("target_tbl")
             if target_table is not None:
                 dto.ods_tbl_phys_nm = target_table
+        if getattr(dto, "tmpr_tbl_phys_nm", None) is None:
+            temp_table = serialized.get("tmpr_tbl_phys_nm") or serialized.get("tmp_tbl_phys_nm") or serialized.get("temp_tbl_phys_nm")
+            if temp_table is not None:
+                dto.tmpr_tbl_phys_nm = temp_table
         return dto
 
     @staticmethod

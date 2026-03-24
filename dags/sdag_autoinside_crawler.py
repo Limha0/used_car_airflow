@@ -199,6 +199,9 @@ def autoinside_crawler_dag():
                     original_count - len(rows),
                 )
 
+        if datst_cd == AUTOINSIDE_DATST_LIST:
+            target_table, _ = _resolve_list_table_targets(tn_data_bsc_info)
+
         _bulk_insert_rows(hook, target_table, rows, truncate=True, allow_only_table_cols=True)
         table_count = CommonUtil.get_table_row_count(hook, target_table)
         logging.info(
@@ -216,6 +219,40 @@ def autoinside_crawler_dag():
             "row_count": len(rows),
             "table_count": table_count,
             "csv_path": str(latest_csv_path),
+        }
+
+    @task
+    def sync_list_tmp_to_source(
+        bsc_infos: dict[str, dict[str, Any]],
+        brand_load_result: dict[str, Any],
+        car_type_load_result: dict[str, Any],
+        list_load_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        for load_result in (brand_load_result, car_type_load_result, list_load_result):
+            if not load_result.get("done"):
+                raise ValueError(f"CSV 적재 완료 조건 미충족: {load_result}")
+
+        tn_data_bsc_info = CommonUtil.build_bsc_info_dto(bsc_infos[AUTOINSIDE_DATST_LIST])
+        tmp_table, source_table = _resolve_list_table_targets(tn_data_bsc_info)
+        hook = PostgresHook(postgres_conn_id="car_db_conn")
+        sync_result = _sync_autoinside_tmp_to_source(
+            hook,
+            tmp_table=tmp_table,
+            source_table=source_table,
+        )
+        logging.info(
+            "오토인사이드 list tmp->source 반영 완료: tmp_table=%s, source_table=%s, tmp_count=%d, source_count=%d",
+            tmp_table,
+            source_table,
+            sync_result["tmp_count"],
+            sync_result["source_count"],
+        )
+        return {
+            "done": True,
+            "tmp_table": tmp_table,
+            "source_table": source_table,
+            "tmp_count": sync_result["tmp_count"],
+            "source_count": sync_result["source_count"],
         }
 
     @task_group(group_id="create_csv_process")
@@ -246,9 +283,15 @@ def autoinside_crawler_dag():
         bsc_infos: dict[str, dict[str, Any]],
         tn_data_clct_dtl_info_map: dict[str, dict[str, Any]],
     ) -> None:
-        load_csv_to_ods.override(task_id="load_brand_csv_to_ods")(bsc_infos, tn_data_clct_dtl_info_map, AUTOINSIDE_DATST_BRAND)
-        load_csv_to_ods.override(task_id="load_car_type_csv_to_ods")(bsc_infos, tn_data_clct_dtl_info_map, AUTOINSIDE_DATST_CAR_TYPE)
-        load_csv_to_ods.override(task_id="load_list_csv_to_ods")(bsc_infos, tn_data_clct_dtl_info_map, AUTOINSIDE_DATST_LIST)
+        brand_load_result = load_csv_to_ods.override(task_id="load_brand_csv_to_ods")(bsc_infos, tn_data_clct_dtl_info_map, AUTOINSIDE_DATST_BRAND)
+        car_type_load_result = load_csv_to_ods.override(task_id="load_car_type_csv_to_ods")(bsc_infos, tn_data_clct_dtl_info_map, AUTOINSIDE_DATST_CAR_TYPE)
+        list_load_result = load_csv_to_ods.override(task_id="load_list_csv_to_ods")(bsc_infos, tn_data_clct_dtl_info_map, AUTOINSIDE_DATST_LIST)
+        sync_list_tmp_to_source.override(task_id="sync_list_tmp_to_source")(
+            bsc_infos,
+            brand_load_result,
+            car_type_load_result,
+            list_load_result,
+        )
 
     infos = insert_collect_data_info()
     tn_data_clct_dtl_info_map = create_csv_process(infos)
@@ -269,8 +312,8 @@ AUTOINSIDE_DATST_LIST = "data3"
 AUTOINSIDE_SITE_NAME = "오토인사이드"
 AUTOINSIDE_BRAND_TABLE = "ods.ods_brand_list_autoinside"
 AUTOINSIDE_CAR_TYPE_TABLE = "ods.ods_car_type_list_autoinside"
-AUTOINSIDE_LIST_TABLE = "ods.ods_tmp_car_list_autoinside"
 AUTOINSIDE_TMP_LIST_TABLE = "ods.ods_tmp_car_list_autoinside"
+AUTOINSIDE_SOURCE_LIST_TABLE = "ods.ods_car_list_autoinside"
 AUTOINSIDE_COLLECT_DETAIL_TABLE = "std.tn_data_clct_dtl_info"
 
 
@@ -422,10 +465,16 @@ def _resolve_target_table_for_datst(datst_cd: str, raw: str | None) -> str:
     if key == AUTOINSIDE_DATST_CAR_TYPE:
         return normalized or AUTOINSIDE_CAR_TYPE_TABLE
     if key == AUTOINSIDE_DATST_LIST:
-        return normalized or AUTOINSIDE_LIST_TABLE
+        return normalized or AUTOINSIDE_TMP_LIST_TABLE
     if normalized:
         return normalized
     raise ValueError(f"적재 대상 테이블을 확인할 수 없습니다: datst_cd={datst_cd}")
+
+
+def _resolve_list_table_targets(tn_data_bsc_info: TnDataBscInfo) -> tuple[str, str]:
+    tmp_table = _normalize_target_table(getattr(tn_data_bsc_info, "tmpr_tbl_phys_nm", None)) or AUTOINSIDE_TMP_LIST_TABLE
+    source_table = _normalize_target_table(getattr(tn_data_bsc_info, "ods_tbl_phys_nm", None)) or AUTOINSIDE_SOURCE_LIST_TABLE
+    return tmp_table, source_table
 
 
 def _dedupe_autoinside_list_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -511,6 +560,105 @@ def _bulk_insert_rows(
             conn.close()
         except Exception:
             pass
+
+
+def _sync_autoinside_tmp_to_source(
+    hook: PostgresHook,
+    *,
+    tmp_table: str,
+    source_table: str,
+    key_cols: tuple[str, str] = ("product_id", "detail_url"),
+    flag_col: str = "register_flag",
+) -> dict[str, int]:
+    tmp_count = CommonUtil.get_table_row_count(hook, tmp_table)
+    if tmp_count == 0:
+        return {"tmp_count": 0, "source_count": CommonUtil.get_table_row_count(hook, source_table)}
+
+    tmp_cols = _get_table_columns(hook, tmp_table)
+    src_cols = _get_table_columns(hook, source_table)
+    tmp_has_flag = flag_col in set(tmp_cols)
+    src_has_flag = flag_col in set(src_cols)
+
+    join_condition = " AND ".join([f'COALESCE(src."{col}", \'\') = COALESCE(tmp."{col}", \'\')' for col in key_cols])
+    not_exists_condition = " AND ".join([f'COALESCE(tmp."{col}", \'\') = COALESCE(src."{col}", \'\')' for col in key_cols])
+
+    conn = hook.get_conn()
+    try:
+        with conn.cursor() as cur:
+            if tmp_has_flag:
+                cur.execute(
+                    f"""
+                    UPDATE {tmp_table} AS tmp
+                    SET "{flag_col}" = CASE
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM {source_table} AS src
+                            WHERE {join_condition}
+                        ) THEN 'Y'
+                        ELSE 'A'
+                    END
+                    """
+                )
+
+            update_cols = [c for c in tmp_cols if c in set(src_cols) and c not in set(key_cols)]
+            set_expr = ", ".join([f'"{c}" = tmp."{c}"' for c in update_cols if c != flag_col])
+            if src_has_flag:
+                set_expr = (set_expr + ", " if set_expr else "") + f'"{flag_col}" = \'Y\''
+            if set_expr:
+                cur.execute(
+                    f"""
+                    UPDATE {source_table} AS src
+                    SET {set_expr}
+                    FROM {tmp_table} AS tmp
+                    WHERE {join_condition}
+                    """
+                )
+
+            insert_cols = [c for c in tmp_cols if c in set(src_cols)]
+            if src_has_flag and flag_col not in insert_cols:
+                insert_cols.append(flag_col)
+            cols_sql = ", ".join([f'"{c}"' for c in insert_cols])
+            select_cols_sql = ", ".join(
+                [
+                    ("tmp." + f'"{c}"') if c != flag_col else ("tmp." + f'"{c}"' if tmp_has_flag else "'A'")
+                    for c in insert_cols
+                ]
+            )
+            cur.execute(
+                f"""
+                INSERT INTO {source_table} ({cols_sql})
+                SELECT {select_cols_sql}
+                FROM {tmp_table} tmp
+                LEFT JOIN {source_table} src
+                  ON {join_condition}
+                WHERE src."{key_cols[0]}" IS NULL
+                  AND src."{key_cols[1]}" IS NULL
+                """
+            )
+
+            if src_has_flag:
+                cur.execute(
+                    f"""
+                    UPDATE {source_table} src
+                    SET "{flag_col}" = 'N'
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM {tmp_table} tmp
+                        WHERE {not_exists_condition}
+                    )
+                    """
+                )
+        conn.commit()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return {
+        "tmp_count": CommonUtil.get_table_row_count(hook, tmp_table),
+        "source_count": CommonUtil.get_table_row_count(hook, source_table),
+    }
 
 
 def activate_paths_for_datst(datst_cd: str, kwargs: dict[str, Any] | None = None) -> None:
