@@ -142,7 +142,10 @@ def kiacar_crawler_dag():
             rows = _dedupe_kiacar_list_rows(rows)
             target_table, _ = _resolve_list_table_targets(tn_data_bsc_info)
 
-        _bulk_insert_rows(hook, target_table, rows, truncate=True, allow_only_table_cols=True)
+        if datst_cd in (KIACAR_DATST_BRAND, KIACAR_DATST_LIST):
+            _delete_snapshot_rows(hook, target_table, rows)
+
+        _bulk_insert_rows(hook, target_table, rows, truncate=False, allow_only_table_cols=True)
         table_count = CommonUtil.get_table_row_count(hook, target_table)
         return {
             "done": True,
@@ -166,12 +169,33 @@ def kiacar_crawler_dag():
         tn_data_bsc_info = CommonUtil.build_bsc_info_dto(bsc_infos[KIACAR_DATST_LIST])
         tmp_table, source_table = _resolve_list_table_targets(tn_data_bsc_info)
         hook = PostgresHook(postgres_conn_id="car_db_conn")
-        sync_result = _sync_kiacar_tmp_to_source(hook, tmp_table=tmp_table, source_table=source_table)
+        current_rows = _read_csv_rows(Path(str(list_load_result.get("csv_path") or "")))
+        sync_result = _sync_kiacar_tmp_to_source(
+            hook,
+            current_rows=current_rows,
+            tmp_table=tmp_table,
+            source_table=source_table,
+        )
+        logging.info(
+            "기아차 list tmp->source 반영 완료: tmp_table=%s, source_table=%s, tmp_count=%d, current_row_count=%d, inserted_count=%d, marked_existing_count=%d, marked_missing_count=%d, source_count=%d",
+            tmp_table,
+            source_table,
+            sync_result["tmp_count"],
+            sync_result["current_row_count"],
+            sync_result["inserted_count"],
+            sync_result["marked_existing_count"],
+            sync_result["marked_missing_count"],
+            sync_result["source_count"],
+        )
         return {
             "done": True,
             "tmp_table": tmp_table,
             "source_table": source_table,
             "tmp_count": sync_result["tmp_count"],
+            "current_row_count": sync_result["current_row_count"],
+            "inserted_count": sync_result["inserted_count"],
+            "marked_existing_count": sync_result["marked_existing_count"],
+            "marked_missing_count": sync_result["marked_missing_count"],
             "source_count": sync_result["source_count"],
         }
 
@@ -494,87 +518,54 @@ def _bulk_insert_rows(
             pass
 
 
-def _sync_kiacar_tmp_to_source(
+def _bulk_update_rows_by_key(
     hook: PostgresHook,
+    full_table_name: str,
+    rows: list[dict[str, Any]],
     *,
-    tmp_table: str,
-    source_table: str,
-    key_cols: tuple[str, str] = ("product_id", "detail_url"),
-    flag_col: str = "register_flag",
-) -> dict[str, int]:
-    tmp_count = CommonUtil.get_table_row_count(hook, tmp_table)
-    if tmp_count == 0:
-        return {"tmp_count": 0, "source_count": CommonUtil.get_table_row_count(hook, source_table)}
+    key_col: str,
+    allow_only_table_cols: bool = True,
+) -> None:
+    if not rows:
+        return
 
-    tmp_cols = _get_table_columns(hook, tmp_table)
-    src_cols = _get_table_columns(hook, source_table)
-    tmp_has_flag = flag_col in set(tmp_cols)
-    src_has_flag = flag_col in set(src_cols)
-    join_condition = " AND ".join([f'COALESCE(src."{col}", \'\') = COALESCE(tmp."{col}", \'\')' for col in key_cols])
-    not_exists_condition = " AND ".join([f'COALESCE(tmp."{col}", \'\') = COALESCE(src."{col}", \'\')' for col in key_cols])
+    table_cols = _get_table_columns(hook, full_table_name) if allow_only_table_cols else []
+    table_col_set = set(table_cols)
+
+    candidate_cols: list[str] = []
+    for row in rows:
+        for key in row.keys():
+            if key not in candidate_cols:
+                candidate_cols.append(key)
+
+    if key_col not in candidate_cols:
+        raise ValueError(f"update 키 컬럼이 없습니다. table={full_table_name}, key_col={key_col}")
+
+    value_cols = [key_col] + [c for c in candidate_cols if c != key_col and (c in table_col_set if table_cols else True)]
+    update_cols = [c for c in value_cols if c != key_col]
+    if not update_cols:
+        return
+
+    values = [
+        tuple(row.get(col) for col in update_cols) + (row.get(key_col),)
+        for row in rows
+        if _normalize_compare_value(row.get(key_col))
+    ]
+    if not values:
+        return
 
     conn = hook.get_conn()
     try:
         with conn.cursor() as cur:
-            if tmp_has_flag:
-                cur.execute(
-                    f"""
-                    UPDATE {tmp_table} AS tmp
-                    SET "{flag_col}" = CASE
-                        WHEN EXISTS (
-                            SELECT 1 FROM {source_table} AS src WHERE {join_condition}
-                        ) THEN 'Y'
-                        ELSE 'A'
-                    END
-                    """
-                )
+            from psycopg2.extras import execute_batch
 
-            update_cols = [c for c in tmp_cols if c in set(src_cols) and c not in set(key_cols)]
-            set_expr = ", ".join([f'"{c}" = tmp."{c}"' for c in update_cols if c != flag_col])
-            if src_has_flag:
-                set_expr = (set_expr + ", " if set_expr else "") + f'"{flag_col}" = \'Y\''
-            if set_expr:
-                cur.execute(
-                    f"""
-                    UPDATE {source_table} AS src
-                    SET {set_expr}
-                    FROM {tmp_table} AS tmp
-                    WHERE {join_condition}
-                    """
-                )
-
-            insert_cols = [c for c in tmp_cols if c in set(src_cols)]
-            if src_has_flag and flag_col not in insert_cols:
-                insert_cols.append(flag_col)
-            cols_sql = ", ".join([f'"{c}"' for c in insert_cols])
-            select_cols_sql = ", ".join(
-                [
-                    ("tmp." + f'"{c}"') if c != flag_col else ("tmp." + f'"{c}"' if tmp_has_flag else "'A'")
-                    for c in insert_cols
-                ]
-            )
-            cur.execute(
-                f"""
-                INSERT INTO {source_table} ({cols_sql})
-                SELECT {select_cols_sql}
-                FROM {tmp_table} tmp
-                LEFT JOIN {source_table} src
-                  ON {join_condition}
-                WHERE src."{key_cols[0]}" IS NULL
-                  AND src."{key_cols[1]}" IS NULL
-                """
-            )
-
-            if src_has_flag:
-                cur.execute(
-                    f"""
-                    UPDATE {source_table} src
-                    SET "{flag_col}" = 'N'
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM {tmp_table} tmp WHERE {not_exists_condition}
-                    )
-                    """
-                )
+            set_sql = ", ".join([f'"{col}" = %s' for col in update_cols])
+            sql = f"""
+            UPDATE {full_table_name}
+            SET {set_sql}
+            WHERE COALESCE("{key_col}"::text, '') = COALESCE(%s::text, '')
+            """
+            execute_batch(cur, sql, values, page_size=500)
         conn.commit()
     finally:
         try:
@@ -582,8 +573,255 @@ def _sync_kiacar_tmp_to_source(
         except Exception:
             pass
 
+
+def _delete_snapshot_rows(
+    hook: PostgresHook,
+    full_table_name: str,
+    rows: list[dict[str, Any]],
+) -> None:
+    if not rows:
+        return
+
+    table_cols = set(_get_table_columns(hook, full_table_name))
+    create_dt_values = sorted(
+        {str(row.get("create_dt") or "").strip() for row in rows if str(row.get("create_dt") or "").strip()}
+    )
+    date_values = sorted(
+        {
+            str(row.get("date_crtr_pnttm") or "").strip()
+            for row in rows
+            if str(row.get("date_crtr_pnttm") or "").strip()
+        }
+    )
+
+    sql = None
+    params: tuple[Any, ...] = ()
+    if "create_dt" in table_cols and create_dt_values:
+        sql = f'DELETE FROM {full_table_name} WHERE "create_dt" = ANY(%s)'
+        params = (create_dt_values,)
+    elif "date_crtr_pnttm" in table_cols and date_values:
+        sql = f'DELETE FROM {full_table_name} WHERE "date_crtr_pnttm" = ANY(%s)'
+        params = (date_values,)
+
+    if not sql:
+        return
+
+    conn = hook.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+        conn.commit()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _normalize_compare_value(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _build_row_key(row: dict[str, Any], key_cols: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(_normalize_compare_value(row.get(col)) for col in key_cols)
+
+
+def _pick_snapshot_audit_values(rows: list[dict[str, Any]]) -> tuple[str, str]:
+    date_crtr_pnttm = ""
+    create_dt = ""
+    for row in rows:
+        row_date = _normalize_compare_value(row.get("date_crtr_pnttm"))
+        row_create_dt = _normalize_compare_value(row.get("create_dt"))
+        if row_date and row_date > date_crtr_pnttm:
+            date_crtr_pnttm = row_date
+        if row_create_dt and row_create_dt > create_dt:
+            create_dt = row_create_dt
+    return date_crtr_pnttm, create_dt
+
+
+def _rows_differ(current_row: dict[str, Any], latest_row: dict[str, Any], compare_cols: list[str]) -> bool:
+    for col in compare_cols:
+        if _normalize_compare_value(current_row.get(col)) != _normalize_compare_value(latest_row.get(col)):
+            return True
+    return False
+
+
+def _fetch_latest_source_rows(
+    hook: PostgresHook,
+    source_table: str,
+    key_cols: tuple[str, ...],
+    order_cols: list[str],
+) -> dict[tuple[str, ...], dict[str, Any]]:
+    key_expr = ", ".join([f'"{col}"' for col in key_cols])
+    order_expr = ", ".join([f'COALESCE("{col}", \'\') DESC' for col in order_cols] + ["ctid DESC"])
+    sql = f"""
+    WITH latest AS (
+        SELECT DISTINCT ON ({key_expr})
+            ctid::text AS _row_ctid,
+            *
+        FROM {source_table}
+        ORDER BY {key_expr}, {order_expr}
+    )
+    SELECT * FROM latest
+    """
+    conn = hook.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            cols = [d[0] for d in cur.description]
+            latest_rows = [dict(zip(cols, row)) for row in cur.fetchall() or []]
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
     return {
-        "tmp_count": CommonUtil.get_table_row_count(hook, tmp_table),
+        _build_row_key(row, key_cols): row
+        for row in latest_rows
+        if any(_normalize_compare_value(row.get(col)) for col in key_cols)
+    }
+
+
+def _sync_kiacar_tmp_to_source(
+    hook: PostgresHook,
+    *,
+    current_rows: list[dict[str, Any]],
+    tmp_table: str,
+    source_table: str,
+    key_cols: tuple[str, ...] = ("product_id", "detail_url"),
+    flag_col: str = "register_flag",
+) -> dict[str, int]:
+    tmp_count = CommonUtil.get_table_row_count(hook, tmp_table)
+    if not current_rows:
+        return {
+            "tmp_count": tmp_count,
+            "current_row_count": 0,
+            "inserted_count": 0,
+            "marked_existing_count": 0,
+            "updated_changed_count": 0,
+            "marked_missing_count": 0,
+            "source_count": CommonUtil.get_table_row_count(hook, source_table),
+        }
+
+    src_cols = _get_table_columns(hook, source_table)
+    src_col_set = set(src_cols)
+    src_has_flag = flag_col in src_col_set
+    missing_key_cols = [col for col in key_cols if col not in src_col_set]
+    if missing_key_cols:
+        raise ValueError(f"source 테이블 키 컬럼 누락: table={source_table}, cols={missing_key_cols}")
+
+    current_rows = _dedupe_kiacar_list_rows(current_rows)
+    date_crtr_pnttm, create_dt = _pick_snapshot_audit_values(current_rows)
+    order_cols = [col for col in ("create_dt", "date_crtr_pnttm") if col in src_col_set]
+    update_key_col = key_cols[0]
+    latest_source_map = _fetch_latest_source_rows(hook, source_table, (update_key_col,), order_cols)
+    compare_exclude_cols = set(key_cols) | {"model_sn", "date_crtr_pnttm", "create_dt", flag_col, "_row_ctid"}
+    compare_cols = [col for col in src_cols if col in current_rows[0] and col not in compare_exclude_cols]
+
+    current_update_key_set: set[str] = set()
+    rows_to_insert: list[dict[str, Any]] = []
+    rows_to_update_changed: list[dict[str, Any]] = []
+    rows_to_mark_existing: list[dict[str, Any]] = []
+    missing_product_ids: list[str] = []
+
+    for current_row in current_rows:
+        update_key = _normalize_compare_value(current_row.get(update_key_col))
+        compare_key = _build_row_key(current_row, key_cols)
+        if not update_key:
+            continue
+        current_update_key_set.add(update_key)
+        latest_row = latest_source_map.get((update_key,))
+
+        if latest_row is None:
+            row_to_insert = {col: current_row.get(col) for col in src_cols if col in current_row}
+            if src_has_flag:
+                row_to_insert[flag_col] = "A"
+            rows_to_insert.append(row_to_insert)
+            continue
+
+        latest_flag = _normalize_compare_value(latest_row.get(flag_col))
+        latest_compare_key = _build_row_key(latest_row, key_cols)
+        has_changes = compare_key != latest_compare_key or _rows_differ(current_row, latest_row, compare_cols)
+
+        if has_changes:
+            row_to_update = {col: current_row.get(col) for col in src_cols if col in current_row}
+            if src_has_flag:
+                row_to_update[flag_col] = "Y"
+            rows_to_update_changed.append(row_to_update)
+            continue
+
+        if src_has_flag and latest_flag != "Y":
+            rows_to_mark_existing.append({
+                update_key_col: current_row.get(update_key_col),
+                flag_col: "Y",
+            })
+
+    for row_key, latest_row in latest_source_map.items():
+        latest_flag = _normalize_compare_value(latest_row.get(flag_col))
+        if row_key[0] not in current_update_key_set and latest_flag != "N":
+            product_id = _normalize_compare_value(latest_row.get(update_key_col))
+            if product_id:
+                missing_product_ids.append(product_id)
+
+    if rows_to_update_changed:
+        _bulk_update_rows_by_key(
+            hook,
+            source_table,
+            rows_to_update_changed,
+            key_col=update_key_col,
+            allow_only_table_cols=True,
+        )
+
+    if rows_to_mark_existing:
+        _bulk_update_rows_by_key(
+            hook,
+            source_table,
+            rows_to_mark_existing,
+            key_col=update_key_col,
+            allow_only_table_cols=True,
+        )
+
+    if rows_to_insert:
+        _bulk_insert_rows(hook, source_table, rows_to_insert, truncate=False, allow_only_table_cols=True)
+
+    if missing_product_ids and src_has_flag:
+        conn = hook.get_conn()
+        try:
+            with conn.cursor() as cur:
+                set_parts = [f'"{flag_col}" = %s']
+                params: list[Any] = ["N"]
+                if "date_crtr_pnttm" in src_col_set and date_crtr_pnttm:
+                    set_parts.append('"date_crtr_pnttm" = %s')
+                    params.append(date_crtr_pnttm)
+                if "create_dt" in src_col_set and create_dt:
+                    set_parts.append('"create_dt" = %s')
+                    params.append(create_dt)
+                params.append(missing_product_ids)
+                cur.execute(
+                    f"""
+                    UPDATE {source_table}
+                    SET {", ".join(set_parts)}
+                    WHERE "{update_key_col}" = ANY(%s)
+                    """,
+                    tuple(params),
+                )
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    return {
+        "tmp_count": tmp_count,
+        "current_row_count": len(current_rows),
+        "inserted_count": len(rows_to_insert),
+        "marked_existing_count": len(rows_to_mark_existing),
+        "updated_changed_count": len(rows_to_update_changed),
+        "marked_missing_count": len(missing_product_ids),
         "source_count": CommonUtil.get_table_row_count(hook, source_table),
     }
 
