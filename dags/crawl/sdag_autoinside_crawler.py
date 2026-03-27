@@ -421,11 +421,6 @@ def _get_img_root_path(kwargs: dict[str, Any] | None = None) -> Path:
     return _get_crawl_base_path(kwargs=kwargs) / "img"
 
 
-def _build_year_site_path(root_path: str | Path, site_name: str, dt: datetime | None = None) -> Path:
-    now = dt or datetime.now()
-    return Path(root_path) / now.strftime("%Y년") / site_name
-
-
 def _clear_directory_contents(dir_path: Path) -> None:
     if not dir_path.exists():
         return
@@ -906,7 +901,7 @@ def activate_paths_for_datst(datst_cd: str, kwargs: dict[str, Any] | None = None
 
     RESULT_DIR = CommonUtil.build_dated_site_path(result_root, site, now)
     LOG_DIR = CommonUtil.build_dated_site_path(log_root, site, now)
-    IMG_BASE = _build_year_site_path(img_root, site, now)
+    IMG_BASE = CommonUtil.build_year_site_path(img_root, site, now)
 
 
 YEAR_STR = ""

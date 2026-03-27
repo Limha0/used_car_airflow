@@ -64,6 +64,20 @@ class CommonUtil:
         return Path(root_path) / year_str / site_name / date_str
 
     @staticmethod
+    def build_year_site_path(
+        root_path: str | Path,
+        site_name: str,
+        dt: datetime | None = None,
+    ) -> Path:
+        """
+        이미지 저장처럼 날짜 폴더 없이 연도/사이트까지만 필요한 경우 사용.
+        예) {root}/2026년/롯데렌터카
+        """
+        now = dt or datetime.now()
+        year_str = now.strftime("%Y년")
+        return Path(root_path) / year_str / site_name
+
+    @staticmethod
     def split_schema_table(full_table_name: str) -> tuple[str, str]:
         if "." in full_table_name:
             schema, table = full_table_name.split(".", 1)
