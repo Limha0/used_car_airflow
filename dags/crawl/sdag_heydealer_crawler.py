@@ -401,11 +401,6 @@ def _get_img_root_path(kwargs: dict[str, Any] | None = None) -> Path:
     return _get_crawl_base_path(kwargs=kwargs) / "img"
 
 
-def _build_year_site_path(root_path: str | Path, site_name: str, dt: datetime | None = None) -> Path:
-    now = dt or datetime.now()
-    return Path(root_path) / now.strftime("%Y년") / site_name
-
-
 def _clear_directory_contents(dir_path: Path) -> None:
     if not dir_path.exists():
         return
@@ -468,7 +463,7 @@ def activate_paths_for_datst(datst_cd: str, kwargs: dict[str, Any] | None = None
     datst_cd 기준으로 crawl/log/img 경로 및 CSV 파일명을 설정한다.
     (각 Task / run_heydealer_job 시작 시 호출)
     """
-    global RESULT_DIR, LOG_DIR, IMG_BASE, IMG_LIST_REL, DETAIL_IMG_REL
+    global RESULT_DIR, LOG_DIR, IMG_BASE, IMG_LIST_REL
     global BRAND_LIST_FILE, CAR_TYPE_LIST_FILE, LIST_FILE, LOG_FILE, BRAND_HIERARCHY_LOG
     global _logger_brand, YEAR_STR, DATE_STR, RUN_TS
 
@@ -483,9 +478,8 @@ def activate_paths_for_datst(datst_cd: str, kwargs: dict[str, Any] | None = None
 
     RESULT_DIR = CommonUtil.build_dated_site_path(result_root, site, now)
     LOG_DIR = CommonUtil.build_dated_site_path(log_root, site, now)
-    IMG_BASE = _build_year_site_path(img_root, site, now)
-    IMG_LIST_REL = f"data/img/{YEAR_STR}/{site}/list"
-    DETAIL_IMG_REL = f"data/img/{YEAR_STR}/{site}/detail"
+    IMG_BASE = CommonUtil.build_year_site_path(img_root, site, now)
+    IMG_LIST_REL = str((IMG_BASE / "list").resolve())
 
     BRAND_LIST_FILE = RESULT_DIR / f"heydealer_brand_list_{RUN_TS}.csv"
     CAR_TYPE_LIST_FILE = RESULT_DIR / f"heydealer_car_type_list_{RUN_TS}.csv"
@@ -857,7 +851,6 @@ RESULT_DIR = Path("/tmp")
 LOG_DIR = Path("/tmp")
 IMG_BASE = Path("/tmp")
 IMG_LIST_REL = ""
-DETAIL_IMG_REL = ""
 BRAND_LIST_FILE = Path("/tmp")
 CAR_TYPE_LIST_FILE = Path("/tmp")
 LIST_FILE = Path("/tmp")
@@ -1340,6 +1333,14 @@ def _click_locator_via_dom(locator) -> None:
 
 
 def _open_car_type_layer(page, current_trigger_name: str | None = None) -> None:
+    # 이전 차종 레이어·모달이 남아 트리거 클릭이 막히는 경우 방지
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(200)
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(200)
+    except Exception:
+        pass
     page.evaluate("window.scrollTo(0, 0)")
     page.wait_for_timeout(500)
     candidate_names: list[str] = []
@@ -1437,17 +1438,12 @@ def rewrite_csv_atomic(file_path, fieldnames, rows):
 
 
 def get_today_img_rel_dir():
-    r"""오늘 날짜 기준 상대 디렉터리 (예: data/img/2026년/리본카/20260312/list)."""
+    """오늘 날짜 기준 목록 이미지 디렉터리(절대경로)."""
     return IMG_LIST_REL
 
 
-def get_today_detail_img_rel_dir():
-    """상세 이미지 상대 디렉터리: data/img/2026년/리본카/20260312/detail"""
-    return DETAIL_IMG_REL
-
-
 def download_list_image(img_url, product_id):
-    """상품 대표 이미지 1장만 다운로드 → product_id_list.png. 성공 시 상대 경로 반환, 실패 시 ""."""
+    """상품 대표 이미지 1장만 다운로드 → product_id_list.png. 성공 시 절대 경로 반환, 실패 시 ""."""
     try:
         if not img_url or "svg" in img_url.lower():
             return ""
@@ -1466,32 +1462,7 @@ def download_list_image(img_url, product_id):
         with open(save_path, "wb") as f:
             for chunk in response.iter_content(1024):
                 f.write(chunk)
-        return f"{get_today_img_rel_dir()}/{filename}"
-    except Exception:
-        return ""
-
-
-def download_detail_image(img_url, product_id, idx):
-    """상세 페이지 이미지 1장 다운로드 → detail/연도/날짜/{product_id}_1.png, _2.png ... (예: Wnqe5KnL_1.png). 성공 시 상대 경로 반환."""
-    try:
-        if not img_url or "svg" in img_url.lower():
-            return ""
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Referer": "https://www.heydealer.com",
-        }
-        response = requests.get(img_url, stream=True, timeout=15, headers=headers)
-        if response.status_code != 200:
-            return ""
-        # 예: /home/limhayoung/data/img/2026년/리본카/20260317/detail
-        save_dir = IMG_BASE / "detail"
-        save_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{product_id}_{idx}.png"
-        save_path = save_dir / filename
-        with open(save_path, "wb") as f:
-            for chunk in response.iter_content(1024):
-                f.write(chunk)
-        return f"{get_today_detail_img_rel_dir()}/{filename}"
+        return str((Path(get_today_img_rel_dir()) / filename).resolve())
     except Exception:
         return ""
 
@@ -1521,81 +1492,6 @@ def download_image(img_url, product_id, idx):
         return True
     except Exception:
         return False
-
-# 상세 페이지 리스트 이미지 DOM: #root > .css-kuuk2w > ... > .css-1fg02ng > .css-vdxqtk > img
-LIST_IMG_DOM_SELECTOR = (
-    "#root .css-kuuk2w .css-18e6263 .css-17qdlp1 .css-fhycda .css-1x0imnr "
-    ".css-1t74t4t .css-a97e7u .css-a97e7u .css-8n2v9x .css-di7boj .css-1fg02ng .css-vdxqtk img"
-)
-
-
-def _collect_image_urls_from_detail_page(page):
-    """상세 페이지에서 차량 이미지 URL 목록을 수집 (중복 제거, 순서 유지). list 폴더용이 아닌 detail 폴더 저장용."""
-    seen = set()
-    urls = []
-    try:
-        page.wait_for_timeout(1200)
-        imgs = page.query_selector_all(LIST_IMG_DOM_SELECTOR)
-        for img in imgs:
-            src = (img.get_attribute("src") or img.get_attribute("data-src") or "").strip()
-            if src and "svg" not in src.lower() and src not in seen:
-                seen.add(src)
-                urls.append(src)
-        try:
-            page.wait_for_selector(".css-12qft46", timeout=20000)
-        except Exception:
-            try:
-                page.wait_for_selector(".css-113wzqa", timeout=10000)
-            except Exception:
-                pass
-        page.wait_for_timeout(1200)
-        for i in range(1, 14):
-            page.evaluate(f"window.scrollTo(0, {i * 500})")
-            time.sleep(0.15)
-        page.evaluate("window.scrollTo(0, 0)")
-        page.wait_for_timeout(800)
-        detail_container = page.query_selector(".css-1uus6sd .css-12qft46")
-        if not detail_container:
-            detail_container = page.query_selector(".css-12qft46")
-        if detail_container:
-            ltrevz_sections = detail_container.query_selector_all(".css-ltrevz")
-            if len(ltrevz_sections) >= 2:
-                sec2 = ltrevz_sections[1]
-                for sel in [".css-5pr39e .css-1i3qy3r .css-1dpi6xl button.css-q47uzu img.css-q38rgl", "button.css-q47uzu img.css-q38rgl", "button img, .css-q47uzu img"]:
-                    for img in sec2.query_selector_all(sel):
-                        src = (img.get_attribute("src") or img.get_attribute("data-src") or "").strip()
-                        if src and "svg" not in src.lower() and src not in seen:
-                            seen.add(src)
-                            urls.append(src)
-            if len(ltrevz_sections) >= 4:
-                sec4 = ltrevz_sections[3]
-                for sel in [".css-5pr39e .css-1i3qy3r .css-hf19cn .css-1a3591h img.css-158t7i4", ".css-5pr39e .css-1i3qy3r .css-w9nhgi img.css-158t7i4", ".css-hf19cn .css-1a3591h img", ".css-hf19cn .css-w9nhgi img", ".css-w9nhgi img.css-158t7i4"]:
-                    for img in sec4.query_selector_all(sel):
-                        src = (img.get_attribute("src") or img.get_attribute("data-src") or "").strip()
-                        if src and "svg" not in src.lower() and src not in seen:
-                            seen.add(src)
-                            urls.append(src)
-        for img in page.query_selector_all("img[src*='heydealer.com'], img[src*='cdn.'], .css-w9nhgi img, .css-1a3591h img, main img"):
-            src = (img.get_attribute("src") or img.get_attribute("data-src") or "").strip()
-            if not src or "svg" in src.lower() or src in seen:
-                continue
-            seen.add(src)
-            urls.append(src)
-        page.wait_for_timeout(800)
-        for i in range(1, 12):
-            page.evaluate(f"window.scrollTo(0, {i * 600})")
-            time.sleep(0.2)
-        for img in page.query_selector_all("img[src], img[data-src]"):
-            src = (img.get_attribute("src") or img.get_attribute("data-src") or "").strip()
-            if not src or "svg" in src.lower() or src in seen:
-                continue
-            if "heydealer" in src or "cdn." in src or len(src) > 20:
-                seen.add(src)
-                urls.append(src)
-    except Exception as e:
-        print(f"      ❌ 이미지 수집 오류: {str(e)[:60]}")
-    return urls
-
 
 def _query_list_car_cards_snapshot(page) -> list[dict[str, str]]:
     """
@@ -1665,17 +1561,6 @@ def _query_list_car_cards_snapshot(page) -> list[dict[str, str]]:
 def _normalize_list_href(href: str) -> str:
     h = (href or "").strip().split("?")[0].rstrip("/")
     return h
-
-
-def _collect_images_from_detail_page(page, product_id):
-    """상세 페이지에서 이미지 URL 수집 후 detail 폴더에 product_id_1.png, product_id_2.png ... 로 저장. car_imgs에는 첫 번째 상대 경로 반환."""
-    car_imgs_path = ""
-    urls = _collect_image_urls_from_detail_page(page)
-    for idx, src in enumerate(urls, 1):
-        path = download_detail_image(src, product_id, idx)
-        if path and not car_imgs_path:
-            car_imgs_path = path
-    return car_imgs_path
 
 
 def _build_card_data_from_snapshot(
@@ -2043,11 +1928,28 @@ def run_heydealer_job(
                     run_logger.info(f"[{display_name}] 새 매물 없음 → 수집 종료")
                     break
 
+            run_logger.info(
+                "[%s] 차종 목록 루프 종료 (이번 차종 누적 %d건, 전체 목록 %d건) → 다음 차종 또는 이미지 단계로 진행",
+                display_name,
+                collected_this_type,
+                len(raw_list),
+            )
+            try:
+                page.evaluate("window.scrollTo(0, 0)")
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(200)
+            except Exception:
+                pass
+
         run_logger.info(f"[1단계] 목록 CSV 생성 완료: {LIST_FILE} ({len(raw_list)}건)")
 
         if raw_list:
-            run_logger.info("[2단계] 목록 이미지 수집 시작 (%d건)", len(raw_list))
+            total_rows = len(raw_list)
+            img_every = 100
+            run_logger.info("[2단계] 목록 이미지 수집 시작 (%d건, 약 %d회 진행 로그 예정)", total_rows, max(1, (total_rows + img_every - 1) // img_every))
             for idx, item in enumerate(raw_list, 1):
+                if idx == 1 or idx % img_every == 0 or idx == total_rows:
+                    run_logger.info("[2단계] 목록 이미지 진행: %d/%d건", idx, total_rows)
                 product_id = item.get("product_id", "")
                 list_image_url = (item.get("list_image_url") or "").strip()
 
@@ -2055,6 +1957,7 @@ def run_heydealer_job(
                     car_imgs_path = download_list_image(list_image_url, product_id)
                     if car_imgs_path:
                         item["car_imgs"] = car_imgs_path
+            run_logger.info("[2단계] 목록 이미지 수집 완료 (%d건 처리)", total_rows)
 
         rewrite_csv_atomic(LIST_FILE, list_fields, raw_list)
         browser.close()

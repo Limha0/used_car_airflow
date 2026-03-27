@@ -442,7 +442,7 @@ def activate_paths_for_datst(datst_cd: str, kwargs: dict[str, Any] | None = None
 
     RESULT_DIR = CommonUtil.build_dated_site_path(result_root, site, now)
     LOG_DIR = CommonUtil.build_dated_site_path(log_root, site, now)
-    IMG_BASE = CommonUtil.build_dated_site_path(img_root, site, now)
+    IMG_BASE = CommonUtil.build_year_site_path(img_root, site, now)
 
 
 try:
@@ -1148,7 +1148,7 @@ def _download_kiacar_card_first_img(page, li, save_dir: Path, file_stem: str, lo
         if not resp or not resp.ok:
             return ""
         out_path.write_bytes(resp.body())
-        return str(out_path)
+        return str(out_path.resolve())
     except Exception as e:
         logger.debug("기아 리스트 이미지 다운로드 실패: %s (%s)", img_url, e)
         return ""
@@ -1289,10 +1289,14 @@ def run_kiacar_list(
 
         seen: set[str] = set()
         model_sn = 0
+        progress_every = 100
         with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=headers)
             w.writeheader()
             for idx in range(total_li):
+                cur = idx + 1
+                if idx == 0 or cur % progress_every == 0 or cur == total_li:
+                    logger.info("기아 리스트 수집 진행: %d/%d (전체 카드 대비 스캔)", cur, total_li)
                 li = items_loc.nth(idx)
                 try:
                     cls = li.get_attribute("class") or ""
