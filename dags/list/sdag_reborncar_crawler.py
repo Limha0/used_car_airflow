@@ -11,6 +11,7 @@ import pendulum
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 _root = Path(__file__).resolve().parent.parent
 if str(_root) not in sys.path:
@@ -1558,20 +1559,28 @@ def reborncar_crawler_dag():
     def insert_csv_process(
         bsc_infos: dict[str, dict[str, Any]],
         tn_data_clct_dtl_info_map: dict[str, dict[str, Any]],
-    ) -> None:
+    ) -> dict[str, Any]:
         brand_load_result = load_csv_to_ods.override(task_id="load_brand_csv_to_ods")(bsc_infos, tn_data_clct_dtl_info_map, REBORNCAR_DATST_BRAND)
         car_type_load_result = load_csv_to_ods.override(task_id="load_car_type_csv_to_ods")(bsc_infos, tn_data_clct_dtl_info_map, REBORNCAR_DATST_CAR_TYPE)
         list_load_result = load_csv_to_ods.override(task_id="load_list_csv_to_ods")(bsc_infos, tn_data_clct_dtl_info_map, REBORNCAR_DATST_LIST)
-        sync_list_tmp_to_source.override(task_id="sync_list_tmp_to_source")(
+        sync_result = sync_list_tmp_to_source.override(task_id="sync_list_tmp_to_source")(
             bsc_infos,
             brand_load_result,
             car_type_load_result,
             list_load_result,
         )
+        return sync_result
 
     infos = insert_collect_data_info()
     tn_data_clct_dtl_info_map = create_csv_process(infos)
-    insert_csv_process(infos, tn_data_clct_dtl_info_map)
+    insert_csv_done = insert_csv_process(infos, tn_data_clct_dtl_info_map)
+
+    trigger_reborncar_detail_crawl = TriggerDagRunOperator(
+        task_id="trigger_reborncar_detail_crawl",
+        trigger_dag_id="sdag_reborncar_detail_crawl",
+        wait_for_completion=False,
+    )
+    insert_csv_done >> trigger_reborncar_detail_crawl
 
 
 reborncar_dag = reborncar_crawler_dag()

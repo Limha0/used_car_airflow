@@ -20,6 +20,7 @@ if str(_root) not in sys.path:
 
 from dto.tn_data_bsc_info import TnDataBscInfo
 from util.common_util import CommonUtil
+from util.playwright_util import GotoSpec, goto_with_retry, install_route_blocking
 
 
 @dag(
@@ -1004,8 +1005,18 @@ def run_kiacar_brand_list(page, result_dir: Path, logger, csv_path: Path | None 
 
     try:
         if URL not in (page.url or ""):
-            page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(3000)
+            goto_with_retry(
+                page,
+                GotoSpec(
+                    URL,
+                    wait_until="commit",
+                    timeout_ms=90_000,
+                    ready_selectors=(SELECTOR_CONTAINER, SELECTOR_BASE, SELECTOR_BASE_FALLBACK),
+                    ready_timeout_ms=20_000,
+                ),
+                logger=logger,
+                attempts=3,
+            )
 
         rows = _collect_brand_rows_in_page(page, SELECTOR_BASE, logger)
         if not rows:
@@ -1368,6 +1379,7 @@ def _run_kiacar_brand_csv(datst_cd: str, kwargs: dict[str, Any] | None = None) -
     with sync_playwright() as p:
         browser = _launch_browser(p, HEADLESS_MODE)
         context = browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 800})
+        install_route_blocking(context)
         page = context.new_page()
         try:
             run_kiacar_brand_list(page, RESULT_DIR, logger, csv_path=csv_path)
@@ -1397,6 +1409,7 @@ def run_kiacar_list_job(
     with sync_playwright() as p:
         browser = _launch_browser(p, HEADLESS_MODE)
         context = browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 800})
+        install_route_blocking(context)
         page = context.new_page()
         try:
             run_kiacar_list(

@@ -20,7 +20,7 @@ import requests
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-from playwright.sync_api import sync_playwright
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 # autoinside/ 에서 실행해도 프로젝트 루트 import 가능하도록
 _root = Path(__file__).resolve().parent.parent
@@ -29,6 +29,7 @@ if str(_root) not in sys.path:
 
 from dto.tn_data_bsc_info import TnDataBscInfo
 from util.common_util import CommonUtil
+from util.playwright_util import GotoSpec, goto_with_retry, install_route_blocking
 
 
 @dag(
@@ -297,20 +298,28 @@ def autoinside_crawler_dag():
     def insert_csv_process(
         bsc_infos: dict[str, dict[str, Any]],
         tn_data_clct_dtl_info_map: dict[str, dict[str, Any]],
-    ) -> None:
+    ) -> dict[str, Any]:
         brand_load_result = load_csv_to_ods.override(task_id="load_brand_csv_to_ods")(bsc_infos, tn_data_clct_dtl_info_map, AUTOINSIDE_DATST_BRAND)
         car_type_load_result = load_csv_to_ods.override(task_id="load_car_type_csv_to_ods")(bsc_infos, tn_data_clct_dtl_info_map, AUTOINSIDE_DATST_CAR_TYPE)
         list_load_result = load_csv_to_ods.override(task_id="load_list_csv_to_ods")(bsc_infos, tn_data_clct_dtl_info_map, AUTOINSIDE_DATST_LIST)
-        sync_list_tmp_to_source.override(task_id="sync_list_tmp_to_source")(
+        sync_result = sync_list_tmp_to_source.override(task_id="sync_list_tmp_to_source")(
             bsc_infos,
             brand_load_result,
             car_type_load_result,
             list_load_result,
         )
+        return sync_result
 
     infos = insert_collect_data_info()
     tn_data_clct_dtl_info_map = create_csv_process(infos)
-    insert_csv_process(infos, tn_data_clct_dtl_info_map)
+    insert_csv_done = insert_csv_process(infos, tn_data_clct_dtl_info_map)
+
+    trigger_autoinside_detail_crawl = TriggerDagRunOperator(
+        task_id="trigger_autoinside_detail_crawl",
+        trigger_dag_id="sdag_autoinside_detail_crawl",
+        wait_for_completion=False,
+    )
+    insert_csv_done >> trigger_autoinside_detail_crawl
 
 # Airflow Variable (기존 크롤러 DAG와 동일)
 USED_CAR_SITE_NAMES_VAR = "used_car_site_names"
@@ -1043,8 +1052,18 @@ def run_autoinside_car_type_list(page, result_dir: Path, logger, csv_path: Path 
 
     try:
         logger.info("오토인사이드 차종 목록 수집 시작: %s", URL)
-        page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(3000)
+        goto_with_retry(
+            page,
+            GotoSpec(
+                URL,
+                wait_until="commit",
+                timeout_ms=90_000,
+                ready_selectors=(SELECTOR_LI, SELECTOR_LI_FALLBACK),
+                ready_timeout_ms=20_000,
+            ),
+            logger=logger,
+            attempts=3,
+        )
 
         # model_list 내 li 대기 (긴 셀렉터 먼저, 실패 시 fallback)
         li_locator = None
@@ -2006,6 +2025,8 @@ def run_autoinside_list_by_car_type(
 
 
 def _run_autoinside_car_type_csv(datst_cd: str, kwargs: dict[str, Any] | None = None) -> str:
+    from playwright.sync_api import sync_playwright
+
     activate_paths_for_datst((datst_cd or AUTOINSIDE_DATST_CAR_TYPE).lower() or AUTOINSIDE_DATST_CAR_TYPE, kwargs=kwargs)
     run_ts = datetime.now().strftime("%Y%m%d%H%M")
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
@@ -2014,15 +2035,30 @@ def _run_autoinside_car_type_csv(datst_cd: str, kwargs: dict[str, Any] | None = 
     car_type_csv = RESULT_DIR / f"autoinside_car_type_list_{run_ts}.csv"
     with sync_playwright() as p:
         browser = _launch_browser(p, HEADLESS_MODE)
-        page = browser.new_page()
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1920, "height": 1080},
+        )
+        install_route_blocking(context)
+        page = context.new_page()
         try:
             run_autoinside_car_type_list(page, RESULT_DIR, logger, csv_path=car_type_csv)
         finally:
+            try:
+                context.close()
+            except Exception:
+                pass
             browser.close()
     return str(car_type_csv)
 
 
 def _run_autoinside_brand_csv(datst_cd: str, kwargs: dict[str, Any] | None = None) -> str:
+    from playwright.sync_api import sync_playwright
+
     activate_paths_for_datst((datst_cd or AUTOINSIDE_DATST_BRAND).lower() or AUTOINSIDE_DATST_BRAND, kwargs=kwargs)
     run_ts = datetime.now().strftime("%Y%m%d%H%M")
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
@@ -2034,10 +2070,23 @@ def _run_autoinside_brand_csv(datst_cd: str, kwargs: dict[str, Any] | None = Non
         return str(brand_csv)
     with sync_playwright() as p:
         browser = _launch_browser(p, HEADLESS_MODE)
-        page = browser.new_page()
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1920, "height": 1080},
+        )
+        install_route_blocking(context)
+        page = context.new_page()
         try:
             run_autoinside_brand_list(page, RESULT_DIR, logger, csv_path=brand_csv)
         finally:
+            try:
+                context.close()
+            except Exception:
+                pass
             browser.close()
     return str(brand_csv)
 
@@ -2049,6 +2098,8 @@ def run_autoinside_list_job(
     car_type_csv_path: str | None = None,
     kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    from playwright.sync_api import sync_playwright
+
     activate_paths_for_datst((bsc.datst_cd or AUTOINSIDE_DATST_LIST).lower() or AUTOINSIDE_DATST_LIST, kwargs=kwargs)
     run_ts = datetime.now().strftime("%Y%m%d%H%M")
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
@@ -2077,7 +2128,16 @@ def run_autoinside_list_job(
 
     with sync_playwright() as p:
         browser = _launch_browser(p, HEADLESS_MODE)
-        page = browser.new_page()
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1920, "height": 1080},
+        )
+        install_route_blocking(context)
+        page = context.new_page()
         try:
             run_autoinside_list_by_car_type(
                 page,
@@ -2089,6 +2149,10 @@ def run_autoinside_list_job(
                 img_dir=list_img_dir,
             )
         finally:
+            try:
+                context.close()
+            except Exception:
+                pass
             browser.close()
 
     count = 0

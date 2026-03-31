@@ -23,6 +23,7 @@ import pendulum
 import requests
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from playwright.sync_api import sync_playwright
 
@@ -1837,7 +1838,7 @@ def hyundaicar_crawler_dag():
     def insert_csv_process(
         bsc_infos: dict[str, dict[str, Any]],
         tn_data_clct_dtl_info_map: dict[str, dict[str, Any]],
-    ) -> None:
+    ):
         brand_load_result = load_csv_to_ods.override(task_id="load_brand_csv_to_ods")(
             bsc_infos,
             tn_data_clct_dtl_info_map,
@@ -1853,16 +1854,30 @@ def hyundaicar_crawler_dag():
             tn_data_clct_dtl_info_map,
             HYUNDAICAR_DATST_LIST,
         )
-        sync_list_tmp_to_source.override(task_id="sync_list_tmp_to_source")(
+        sync_result = sync_list_tmp_to_source.override(task_id="sync_list_tmp_to_source")(
             bsc_infos,
             brand_load_result,
             car_type_load_result,
             list_load_result,
         )
+        return sync_result
 
     infos = insert_collect_data_info()
     tn_data_clct_dtl_info_map = create_csv_process(infos)
-    insert_csv_process(infos, tn_data_clct_dtl_info_map)
+    sync_result = insert_csv_process(infos, tn_data_clct_dtl_info_map)
+
+    trigger_detail_dag = TriggerDagRunOperator(
+        task_id="trigger_hyundaicar_detail_dag",
+        trigger_dag_id="sdag_hyundaicar_detail_crawl",
+        wait_for_completion=False,
+        reset_dag_run=True,
+        conf={
+            "source_dag_id": "sdag_hyundaicar_crawler",
+            "source_run_id": "{{ run_id }}",
+            "source_logical_date": "{{ ds }}",
+        },
+    )
+    sync_result >> trigger_detail_dag
 
 
 dag_object = hyundaicar_crawler_dag()

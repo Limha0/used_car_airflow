@@ -25,6 +25,7 @@ if str(_root) not in sys.path:
 
 from dto.tn_data_bsc_info import TnDataBscInfo
 from util.common_util import CommonUtil
+from util.playwright_util import GotoSpec, goto_with_retry, install_route_blocking
 
 
 @dag(
@@ -626,8 +627,19 @@ def run_lotterentacar_car_type_list(page, result_dir: Path, logger, csv_path: Pa
 
     try:
         logger.info("====================롯데렌터카 차종 목록 수집 시작 ====================")
-        page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(3000)
+        goto_with_retry(
+            page,
+            GotoSpec(
+                URL,
+                wait_until="commit",
+                timeout_ms=90_000,
+                ready_selectors=(SELECTOR_CONTAINER,),
+                ready_timeout_ms=20_000,
+            ),
+            logger=logger,
+            attempts=3,
+        )
+        page.wait_for_timeout(800)
 
         # React 영역 로드 대기
         try:
@@ -1397,6 +1409,7 @@ def run_lotterentacar_fetch_detail_images(result_dir: Path, logger, list_csv_pat
                 viewport={"width": 1280, "height": 720},
                 user_agent=REQUEST_HEADERS.get("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
             )
+            install_route_blocking(context)
             page = context.new_page()
             for i, row in enumerate(rows):
                 product_id = (row.get("product_id") or "").strip()
@@ -1419,13 +1432,24 @@ def run_lotterentacar_fetch_detail_images(result_dir: Path, logger, list_csv_pat
                 else:
                     url = f"{URL_VIEW_BASE}?carId={product_id}&saleTyRent=true"
                 try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=DETAIL_PAGE_TIMEOUT)
+                    goto_with_retry(
+                        page,
+                        GotoSpec(
+                            url,
+                            wait_until="commit",
+                            timeout_ms=int(DETAIL_PAGE_TIMEOUT),
+                            ready_selectors=(SELECTOR_DETAIL_IMAGE_CONTAINER,),
+                            ready_timeout_ms=10_000,
+                        ),
+                        logger=logger,
+                        attempts=3,
+                    )
                     # 이미지 영역 로드 대기 (React/동적 렌더)
                     try:
                         page.wait_for_selector(SELECTOR_DETAIL_IMAGE_CONTAINER, timeout=10000)
                     except Exception:
                         pass
-                    page.wait_for_timeout(2500)
+                    page.wait_for_timeout(1200)
                     imgs = None
                     for sel in SELECTOR_DETAIL_IMAGES:
                         loc = page.locator(sel)

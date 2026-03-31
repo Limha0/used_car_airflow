@@ -78,6 +78,50 @@ class CommonUtil:
         return Path(root_path) / year_str / site_name
 
     @staticmethod
+    def clear_image_files(
+        dir_path: str | Path,
+        *,
+        recursive: bool = False,
+        extensions: set[str] | None = None,
+    ) -> int:
+        """
+        디렉터리 내부의 '이미지 파일'만 삭제한다(디렉터리/비이미지 파일은 유지).
+
+        - **dir_path**: 대상 디렉터리
+        - **recursive**: True면 하위 디렉터리까지 순회(rglob)
+        - **extensions**: 삭제 대상 확장자 집합(점 포함, 소문자). None이면 기본 이미지 확장자 사용
+
+        반환값: 삭제된 파일 개수
+        """
+        path = Path(dir_path)
+        if not path.exists() or not path.is_dir():
+            return 0
+
+        exts = extensions or {
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp",
+            ".gif",
+            ".bmp",
+        }
+        exts = {e.lower() if e.startswith(".") else ("." + e.lower()) for e in exts}
+
+        deleted = 0
+        it = path.rglob("*") if recursive else path.iterdir()
+        for child in it:
+            try:
+                if not child.is_file():
+                    continue
+                if child.suffix.lower() not in exts:
+                    continue
+                child.unlink()
+                deleted += 1
+            except Exception:
+                continue
+        return deleted
+
+    @staticmethod
     def split_schema_table(full_table_name: str) -> tuple[str, str]:
         if "." in full_table_name:
             schema, table = full_table_name.split(".", 1)

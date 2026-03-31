@@ -1,5 +1,6 @@
 import csv
 import logging
+import os
 import re
 import shutil
 import sys
@@ -13,8 +14,8 @@ import pendulum
 import requests
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-from playwright.sync_api import sync_playwright
 
 _root = Path(__file__).resolve().parent.parent
 if str(_root) not in sys.path:
@@ -22,6 +23,7 @@ if str(_root) not in sys.path:
 
 from dto.tn_data_bsc_info import TnDataBscInfo
 from util.common_util import CommonUtil
+from util.playwright_util import GotoSpec, goto_with_retry, install_route_blocking
 
 
 @dag(
@@ -281,20 +283,27 @@ def heydealer_crawler():
     def insert_csv_process(
         bsc_infos: dict[str, dict[str, Any]],
         tn_data_clct_dtl_info_map: dict[str, dict[str, Any]],
-    ) -> None:
+    ) -> dict[str, Any]:
         brand_load_result = load_csv_to_ods.override(task_id="load_brand_csv_to_ods")(bsc_infos, tn_data_clct_dtl_info_map, HEYDEALER_DATST_BRAND)
         car_type_load_result = load_csv_to_ods.override(task_id="load_car_type_csv_to_ods")(bsc_infos, tn_data_clct_dtl_info_map, HEYDEALER_DATST_CAR_TYPE)
         list_load_result = load_csv_to_ods.override(task_id="load_list_csv_to_ods")(bsc_infos, tn_data_clct_dtl_info_map, HEYDEALER_DATST_LIST)
-        sync_list_tmp_to_source.override(task_id="sync_list_tmp_to_source")(
+        sync_result = sync_list_tmp_to_source.override(task_id="sync_list_tmp_to_source")(
             bsc_infos,
             brand_load_result,
             car_type_load_result,
             list_load_result,
         )
+        return sync_result
 
     infos = insert_collect_data_info()
     tn_data_clct_dtl_info_map = create_csv_process(infos)
-    insert_csv_process(infos, tn_data_clct_dtl_info_map)
+    insert_csv_done = insert_csv_process(infos, tn_data_clct_dtl_info_map)
+    trigger_heydealer_detail_crawl = TriggerDagRunOperator(
+        task_id="trigger_heydealer_detail_crawl",
+        trigger_dag_id="sdag_heydealer_detail_crawl",
+        wait_for_completion=False,
+    )
+    insert_csv_done >> trigger_heydealer_detail_crawl
 
 
 # Airflow Variable 키
@@ -1614,13 +1623,22 @@ def _build_card_data_from_snapshot(
         if grade_name:
             data["model_list_2"] = grade_name
 
-        if grade_name and raw_model_name.endswith(" " + grade_name):
-            data["car_name"] = raw_model_name
-        elif grade_name and raw_model_name.endswith(grade_name):
-            base = raw_model_name[: -len(grade_name)].rstrip()
-            data["car_name"] = f"{base} {grade_name}" if base else grade_name
+        # DOM: .css-9j6363 안에 .css-jk6asd(1~2줄) + .css-13wylk3(등급) — 둘째 줄(예: 2.5 가솔린)이 있으면 car_name에 반드시 포함
+        if second_name:
+            if grade_name:
+                data["car_name"] = " ".join(p for p in [raw_model_name, second_name, grade_name] if p).strip()
+            else:
+                data["car_name"] = " ".join(p for p in [raw_model_name, second_name] if p).strip()
+        elif grade_name:
+            if raw_model_name.endswith(" " + grade_name):
+                data["car_name"] = raw_model_name
+            elif raw_model_name.endswith(grade_name):
+                base = raw_model_name[: -len(grade_name)].rstrip()
+                data["car_name"] = f"{base} {grade_name}" if base else grade_name
+            else:
+                data["car_name"] = " ".join(p for p in [raw_model_name, grade_name] if p).strip()
         else:
-            data["car_name"] = " ".join(p for p in [raw_model_name, grade_name] if p).strip()
+            data["car_name"] = raw_model_name
 
         year_km = (card.get("year_km") or "").strip()
         if "ㆍ" in year_km:
@@ -1682,15 +1700,23 @@ def _extract_card_heydealer(elem, idx, brand_map, car_type="", brand_by_name=Non
             data["grade_name"] = grade.inner_text().strip() if grade else ""
             if data["grade_name"]:
                 data["model_list_2"] = data["grade_name"]
-            # 차량 풀네임: 모델명 + 띄어쓰기 + 등급 (예: "더 뉴 레이 시그니처"). 한 span에 "더 뉴 레이시그니처"처럼 붙어 나오면 등급 앞에 공백 삽입
-            grade_name = data.get("grade_name", "")
-            if grade_name and raw_model_name.endswith(" " + grade_name):
-                data["car_name"] = raw_model_name  # 이미 "더 뉴 레이 시그니처" 형태
-            elif grade_name and raw_model_name.endswith(grade_name):
-                base = raw_model_name[: -len(grade_name)].rstrip()
-                data["car_name"] = f"{base} {grade_name}" if base else grade_name
+            grade_name = (data.get("grade_name") or "").strip()
+            second_name = (data.get("model_second_name") or "").strip()
+            if second_name:
+                if grade_name:
+                    data["car_name"] = " ".join(p for p in [raw_model_name, second_name, grade_name] if p).strip()
+                else:
+                    data["car_name"] = " ".join(p for p in [raw_model_name, second_name] if p).strip()
+            elif grade_name:
+                if raw_model_name.endswith(" " + grade_name):
+                    data["car_name"] = raw_model_name
+                elif raw_model_name.endswith(grade_name):
+                    base = raw_model_name[: -len(grade_name)].rstrip()
+                    data["car_name"] = f"{base} {grade_name}" if base else grade_name
+                else:
+                    data["car_name"] = " ".join(p for p in [raw_model_name, grade_name] if p).strip()
             else:
-                data["car_name"] = " ".join(p for p in [raw_model_name, grade_name] if p).strip()
+                data["car_name"] = raw_model_name
         yk_el = elem.query_selector(".css-6bza35")
         if yk_el:
             txt = yk_el.inner_text().strip()
@@ -1722,6 +1748,9 @@ def run_heydealer_job(
     - car_type_csv_path: run_car_type_csv 결과 경로 (검증용, 선택)
     """
     global BRAND_LIST_FILE
+
+    # Airflow DAG 파싱 단계에서 playwright 미설치/무거운 import로 DAGFileProcessor가 죽는 문제 방지
+    from playwright.sync_api import sync_playwright
 
     activate_paths_for_datst((bsc.datst_cd or HEYDEALER_DATST_LIST).lower() or HEYDEALER_DATST_LIST, kwargs=kwargs)
 
@@ -1806,21 +1835,23 @@ def run_heydealer_job(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
         )
+        install_route_blocking(context)
         page = context.new_page()
         page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
-        for nav_try in range(3):
-            try:
-                page.goto(list_url, wait_until="commit", timeout=60000)
-                page.wait_for_load_state("domcontentloaded", timeout=15000)
-                break
-            except Exception as e:
-                if nav_try < 2:
-                    run_logger.warning(f"목록 페이지 재시도 ({nav_try + 2}/3): {e}")
-                    time.sleep(3)
-                else:
-                    raise RuntimeError(f"목록 페이지 접속 실패: {list_url}") from e
-        page.wait_for_timeout(2000)
+        goto_with_retry(
+            page,
+            GotoSpec(
+                list_url,
+                wait_until="commit",
+                timeout_ms=90_000,
+                ready_selectors=("body",),
+                ready_timeout_ms=20_000,
+            ),
+            logger=run_logger,
+            attempts=3,
+        )
+        page.wait_for_timeout(600)
         current_car_type_trigger_name = "차체"
 
         for car_type_value, car_type_name in car_type_entries:
@@ -1848,6 +1879,21 @@ def run_heydealer_job(
                 run_logger.info("차종 없음(전체) → 수집 시작")
 
             while True:
+                # 안전장치: 무한 스크롤/네트워크 지연으로 과도하게 오래 도는 케이스 방지
+                # (기본 90분, 필요 시 환경변수로 조정)
+                if "_heydealer_type_start_ts" not in locals():
+                    _heydealer_type_start_ts = time.time()
+                max_type_minutes = int(os.environ.get("HEYDEALER_MAX_MINUTES_PER_TYPE", "90"))
+                if time.time() - _heydealer_type_start_ts > max_type_minutes * 60:
+                    run_logger.warning(
+                        "[%s] 차종별 최대 실행시간(%d분) 초과 → 강제 종료 (collected=%d, expected=%s)",
+                        display_name,
+                        max_type_minutes,
+                        collected_this_type,
+                        expected_count,
+                    )
+                    break
+
                 if TARGET_COUNT is not None and collected_this_type >= TARGET_COUNT:
                     run_logger.info(f"[{display_name}] 목표 {TARGET_COUNT}개 수집 완료")
                     break
@@ -2120,3 +2166,17 @@ def _run_heydealer_car_type_csv(datst_cd: str, kwargs: dict[str, Any] | None = N
 
 
 dag_object = heydealer_crawler()
+
+
+# only run if the module is the main program
+if __name__ == "__main__":
+    conn_path = "../connections_minio_pg.yaml"
+    # variables_path = "../variables.yaml"
+    dtst_cd = ""
+
+    dag_object.test(
+        execution_date=datetime(2025, 10, 10, 8, 0),
+        conn_file_path=conn_path,
+        # variable_file_path=variables_path,
+        # run_conf={"dtst_cd": dtst_cd},
+    )

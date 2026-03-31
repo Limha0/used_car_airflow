@@ -31,6 +31,7 @@ if str(_root) not in sys.path:
 
 from dto.tn_data_bsc_info import TnDataBscInfo
 from util.common_util import CommonUtil
+from util.playwright_util import images_enabled, install_route_blocking
 
 
 @dag(
@@ -1473,6 +1474,8 @@ def _load_brand_list_lookup(result_dir: Path, brand_path: Path | None = None) ->
 
 
 def _download_list_image(page, img_src: str, save_path: Path, logger) -> bool:
+    if not images_enabled():
+        return False
     if not img_src or not img_src.startswith("http"):
         return False
     try:
@@ -1671,9 +1674,24 @@ def run_kcar_list(
 
     try:
         logger.info("K Car 페이지 접속 중...")
-        page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(3000)
-        _dismiss_kcar_popups(page)
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                _ensure_kcar_search_page(page, logger)
+                break
+            except Exception as e:
+                last_err = e
+                logger.warning("K Car 페이지 접속 재시도(%d/3): %s", attempt + 2, e)
+                try:
+                    page.wait_for_timeout(1500)
+                    page.reload(wait_until="domcontentloaded", timeout=90000)
+                    page.wait_for_timeout(1200)
+                except Exception:
+                    pass
+                if attempt >= 1:
+                    time.sleep(2)
+        else:
+            raise last_err if last_err is not None else RuntimeError("K Car 페이지 접속 실패")
 
         direct_site_total = _get_kcar_expected_count(page)
         if direct_site_total:
@@ -1907,6 +1925,7 @@ def _run_kcar_car_type_csv(datst_cd: str, kwargs: dict[str, Any] | None = None) 
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
         )
+        install_route_blocking(context)
         page = context.new_page()
         try:
             run_kcar_car_type_list(page, RESULT_DIR, logger, csv_path=csv_path)
@@ -1928,6 +1947,7 @@ def _run_kcar_brand_csv(datst_cd: str, kwargs: dict[str, Any] | None = None) -> 
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
         )
+        install_route_blocking(context)
         page = context.new_page()
         try:
             run_kcar_brand_list(page, RESULT_DIR, logger, csv_path=csv_path)
