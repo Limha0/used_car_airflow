@@ -3,12 +3,14 @@ import logging
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
 import pendulum
+import requests
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
 from airflow.providers.postgres.hooks.postgres import PostgresHook
@@ -269,7 +271,8 @@ def reborncar_detail_crawl():
                     context, page = _new_context_and_page()
                     logging.info("브라우저 컨텍스트 재생성 완료: processed=%d/%d", idx, total)
 
-                time.sleep(0.3)
+                # 과도한 딜레이로 전체 시간이 늘어나는 것을 방지(서버 부하 방지는 유지)
+                time.sleep(0.1)
 
             browser.close()
 
@@ -460,6 +463,8 @@ def _download_image(page, image_url: str, save_path: Path) -> bool:
                 "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
             ),
         }
+        # page.request는 안정적이지만 순차 다운로드가 느려질 수 있어,
+        # 이미지 저장 단계에서는 requests로 병렬화할 수 있도록 별도 함수도 사용한다.
         resp = page.request.get(image_url, timeout=30000, headers=headers)
         if not resp or not resp.ok:
             return False
@@ -468,6 +473,27 @@ def _download_image(page, image_url: str, save_path: Path) -> bool:
         return True
     except Exception:
         return False
+
+
+def _download_image_requests(image_url: str, save_path: Path, *, referer: str) -> bool:
+    headers = {
+        "Referer": (referer or "https://www.reborncar.co.kr/").split("#")[0],
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        ),
+    }
+    for _ in range(2):
+        try:
+            r = requests.get(image_url, headers=headers, timeout=20)
+            if r.status_code != 200 or not r.content:
+                continue
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            save_path.write_bytes(r.content)
+            return True
+        except Exception:
+            continue
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -578,7 +604,9 @@ def _crawl_one(
         body_list = info_section.locator(".vip-car-info .vip-car-info-body .info-list .info-list-con")
         for i in range(body_list.count()):
             con = body_list.nth(i)
-            label = _safe_text(con.locator(".list-con .info-txt"))
+            label_raw = _safe_text(con.locator(".list-con .info-txt"))
+            # "사고여부 >"처럼 '>'가 포함되는 케이스가 있어 정규화 후 비교
+            label = _norm_space(label_raw).replace(">", "").strip()
             # 라벨별로 info-tit의 세부 클래스가 다를 수 있어 우선순위 셀렉터를 둔다.
             val = ""
             if label == "사고여부":
@@ -727,7 +755,7 @@ def _crawl_one(
             img_nodes.append(root.locator(".vip-visual .vip-visual-detail .vip-visual-detail .visual-detail .detail-img img"))
             img_nodes.append(root.locator(".vip-visual .vip-visual-list .visual-box .visual-con img"))
             seen: set[str] = set()
-            idx_img = 0
+            urls: list[str] = []
             try:
                 root.locator(".vip-visual").first.scroll_into_view_if_needed(timeout=5000)
                 page.wait_for_timeout(200)
@@ -748,9 +776,23 @@ def _crawl_one(
                     if src in seen:
                         continue
                     seen.add(src)
-                    idx_img += 1
-                    out = detail_img_dir / f"{product_id}_{idx_img}.png"
-                    _download_image(page, src, out)
+                    urls.append(src)
+
+            if urls:
+                # 이미지 다운로드는 병렬 처리로 시간 단축(누락 없이 모두 저장)
+                referer = page_url or "https://www.reborncar.co.kr/"
+                jobs = []
+                max_workers = 6 if len(urls) >= 6 else max(2, min(4, len(urls)))
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    for idx_img, src in enumerate(urls, start=1):
+                        out = detail_img_dir / f"{product_id}_{idx_img}.png"
+                        jobs.append(ex.submit(_download_image_requests, src, out, referer=referer))
+                    # 결과 소비(예외 삼킴). 실패해도 다음 이미지 계속 진행.
+                    for fut in as_completed(jobs):
+                        try:
+                            fut.result()
+                        except Exception:
+                            pass
         except Exception:
             pass
 
