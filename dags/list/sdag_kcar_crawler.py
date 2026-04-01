@@ -43,10 +43,13 @@ from util.playwright_util import images_enabled, install_route_blocking
     tags=["used_car", "kcar", "crawler", "day"],
 )
 def kcar_crawler_dag():
-    pg_hook = PostgresHook(postgres_conn_id="car_db_conn")
+    
 
     @task
     def insert_collect_data_info(**kwargs) -> dict[str, dict[str, Any]]:
+        
+        pg_hook = PostgresHook(postgres_conn_id="car_db_conn")
+
         select_bsc_info_stmt = f"""
         SELECT * FROM std.tn_data_bsc_info tdbi
         WHERE 1=1

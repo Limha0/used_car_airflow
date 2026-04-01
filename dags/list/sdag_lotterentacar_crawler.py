@@ -44,11 +44,14 @@ def lotterentacar_crawler_dag():
     - 차종 CSV → 브랜드 CSV → 목록/이미지 순, 태스크별 파일 생성
     """
 
-    # PostgresHook 객체 생성
-    pg_hook = PostgresHook(postgres_conn_id="car_db_conn")
+    
 
     @task
     def insert_collect_data_info(**kwargs) -> dict[str, dict[str, Any]]:
+        
+        # PostgresHook 객체 생성
+        pg_hook = PostgresHook(postgres_conn_id="car_db_conn")
+
         """std.tn_data_bsc_info에서 롯데렌터카(ps00006) 수집 대상 기본 정보 조회."""
         select_bsc_info_stmt = f"""
         SELECT * FROM std.tn_data_bsc_info tdbi

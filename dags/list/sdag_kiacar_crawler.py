@@ -11,6 +11,7 @@ from urllib.parse import urljoin
 import pendulum
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from playwright.sync_api import sync_playwright
 
@@ -32,10 +33,13 @@ from util.playwright_util import GotoSpec, goto_with_retry, install_route_blocki
     tags=["used_car", "kiacar", "crawler", "day"],
 )
 def kiacar_crawler_dag():
-    pg_hook = PostgresHook(postgres_conn_id="car_db_conn")
+    
 
     @task
     def insert_collect_data_info(**kwargs) -> dict[str, dict[str, Any]]:
+        
+        pg_hook = PostgresHook(postgres_conn_id="car_db_conn")
+
         select_bsc_info_stmt = f"""
         SELECT * FROM std.tn_data_bsc_info tdbi
         WHERE 1=1
@@ -221,7 +225,7 @@ def kiacar_crawler_dag():
     def insert_csv_process(
         bsc_infos: dict[str, dict[str, Any]],
         tn_data_clct_dtl_info_map: dict[str, dict[str, Any]],
-    ) -> None:
+    ) -> dict[str, Any]:
         brand_load_result = load_csv_to_ods.override(task_id="load_brand_csv_to_ods")(
             bsc_infos,
             tn_data_clct_dtl_info_map,
@@ -232,15 +236,29 @@ def kiacar_crawler_dag():
             tn_data_clct_dtl_info_map,
             KIACAR_DATST_LIST,
         )
-        sync_list_tmp_to_source.override(task_id="sync_list_tmp_to_source")(
+        sync_result = sync_list_tmp_to_source.override(task_id="sync_list_tmp_to_source")(
             bsc_infos,
             brand_load_result,
             list_load_result,
         )
+        return sync_result
 
     infos = insert_collect_data_info()
     tn_data_clct_dtl_info_map = create_csv_process(infos)
-    insert_csv_process(infos, tn_data_clct_dtl_info_map)
+    sync_result = insert_csv_process(infos, tn_data_clct_dtl_info_map)
+
+    trigger_kiacar_detail_dag = TriggerDagRunOperator(
+        task_id="trigger_kiacar_detail_dag",
+        trigger_dag_id="sdag_kiacar_detail_crawl",
+        wait_for_completion=False,
+        reset_dag_run=True,
+        conf={
+            "source_dag_id": "sdag_kiacar_crawler",
+            "source_run_id": "{{ run_id }}",
+            "source_logical_date": "{{ ds }}",
+        },
+    )
+    sync_result >> trigger_kiacar_detail_dag
 
 
 USED_CAR_SITE_NAMES_VAR = "used_car_site_names"
@@ -260,11 +278,15 @@ KIACAR_COLLECT_DETAIL_TABLE = "std.tn_data_clct_dtl_info"
 
 URL = "https://cpo.kia.com/products/"
 DETAIL_URL_TEMPLATE = "https://cpo.kia.com/products/detail/?id={}"
+# goto 준비 확인용(Next.js 루트 → 필터/리스트는 SELECTOR_BASE 계열)
+# 주의: Emotion 해시(.css-xxxx)는 빌드마다 바뀌므로 쓰지 않는다.
+SELECTOR_CONTAINER = "#__next"
 SELECTOR_BASE = (
-    ".buy-carlist__left-side.show-pc .filter-info.js-select-scrollbar "
-    ".filter-info__item:first-child .filter-info__content .css-hu289v"
+    ".buy-carlist__left-side .filter-info.js-select-scrollbar "
+    ".filter-info__item:first-child .filter-info__content"
 )
-SELECTOR_BASE_FALLBACK = ".filter-info__content .css-hu289v"
+SELECTOR_BASE_FALLBACK = ".filter-info .filter-info__item:first-child .filter-info__content"
+SELECTOR_BRAND_TREE_WAIT = ".filter-info__item:first-child .filter-info__content .model-select__btn.depth1"
 SELECTOR_CAR_LIST_ROOT = ".carcard-list"
 SELECTOR_CAR_ITEM = f"{SELECTOR_CAR_LIST_ROOT} li.item-card.is-pc"
 EXCLUDE_ITEM_CLASS = "css-1759cna"
@@ -904,10 +926,27 @@ def _dismiss_popups_kiacar(page, logger) -> None:
 def _collect_brand_rows_in_page(page, base_selector: str, logger) -> list[dict[str, str]]:
     js = r"""
     (baseSel) => {
-      const base = document.querySelector(baseSel) || document.querySelector('.css-hu289v');
+      const trySelectors = [
+        baseSel,
+        '.buy-carlist__left-side .filter-info.js-select-scrollbar .filter-info__item:first-child .filter-info__content',
+        '.buy-carlist__left-side .filter-info .filter-info__item:first-child .filter-info__content',
+        '.filter-info .filter-info__item:first-child .filter-info__content',
+        '.filter-info__item:first-child .filter-info__content',
+      ];
+      let base = null;
+      for (const s of trySelectors) {
+        if (!s) continue;
+        base = document.querySelector(s);
+        if (base) break;
+      }
       if (!base) return { ok: false, reason: 'base_not_found', rows: [] };
+
       const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
-      const nameOf = (btn) => norm(btn?.querySelector?.('.item-txt__name')?.textContent || '');
+      const nameOf = (btn) => {
+        const t = btn?.querySelector?.('.item-txt__name')?.textContent;
+        if (t) return norm(t);
+        return norm(btn?.textContent || '');
+      };
       const clickAndMark = (btn) => {
         if (!btn) return false;
         try { btn.scrollIntoView({ block: 'center' }); } catch(e) {}
@@ -919,8 +958,29 @@ def _collect_brand_rows_in_page(page, base_selector: str, logger) -> list[dict[s
         if (sib && sib.classList && sib.classList.contains('child')) return sib;
         return null;
       };
+      const depthBtns = (root, depthNum, directOnly) => {
+        const cls = 'depth' + depthNum;
+        const primary = directOnly
+          ? ':scope > .model-select__btn.' + cls
+          : '.model-select__btn.' + cls;
+        let btns = Array.from(root.querySelectorAll(primary));
+        if (btns.length === 0) {
+          const pool = Array.from(
+            directOnly ? root.querySelectorAll(':scope > button.model-select__btn') : root.querySelectorAll('button.model-select__btn')
+          );
+          btns = pool.filter((b) => {
+            const cs = (b.className || '').toString();
+            return cs.split(/\s+/).includes(cls);
+          });
+        }
+        return btns;
+      };
+
       const rows = [];
-      const depth1Btns = Array.from(base.querySelectorAll('.model-select__btn.depth1'));
+      const depth1Btns = depthBtns(base, 1, false);
+      if (depth1Btns.length === 0) {
+        return { ok: true, rows: [], reason: 'no_depth1' };
+      }
       for (const d1 of depth1Btns) {
         clickAndMark(d1);
         const car_list = nameOf(d1);
@@ -929,12 +989,12 @@ def _collect_brand_rows_in_page(page, base_selector: str, logger) -> list[dict[s
           rows.push({ car_list, model_list: '', model_list_1: '', model_list_2: '' });
           continue;
         }
-        const depth2Btns = Array.from(c1.querySelectorAll(':scope > .model-select__btn.depth2'));
-        if (depth2Btns.length === 0) {
+        const d2list = depthBtns(c1, 2, true);
+        if (d2list.length === 0) {
           rows.push({ car_list, model_list: '', model_list_1: '', model_list_2: '' });
           continue;
         }
-        for (const d2 of depth2Btns) {
+        for (const d2 of d2list) {
           clickAndMark(d2);
           const model_list = nameOf(d2);
           const c2 = nextChild(d2);
@@ -942,12 +1002,12 @@ def _collect_brand_rows_in_page(page, base_selector: str, logger) -> list[dict[s
             rows.push({ car_list, model_list, model_list_1: '', model_list_2: '' });
             continue;
           }
-          const depth3Btns = Array.from(c2.querySelectorAll(':scope > .model-select__btn.depth3'));
-          if (depth3Btns.length === 0) {
+          const d3list = depthBtns(c2, 3, true);
+          if (d3list.length === 0) {
             rows.push({ car_list, model_list, model_list_1: '', model_list_2: '' });
             continue;
           }
-          for (const d3 of depth3Btns) {
+          for (const d3 of d3list) {
             clickAndMark(d3);
             const model_list_1 = nameOf(d3);
             const c3 = nextChild(d3);
@@ -955,12 +1015,12 @@ def _collect_brand_rows_in_page(page, base_selector: str, logger) -> list[dict[s
               rows.push({ car_list, model_list, model_list_1, model_list_2: '' });
               continue;
             }
-            const depth4Btns = Array.from(c3.querySelectorAll(':scope > .model-select__btn.depth4'));
-            if (depth4Btns.length === 0) {
+            const d4list = depthBtns(c3, 4, true);
+            if (d4list.length === 0) {
               rows.push({ car_list, model_list, model_list_1, model_list_2: '' });
               continue;
             }
-            for (const d4 of depth4Btns) {
+            for (const d4 of d4list) {
               clickAndMark(d4);
               rows.push({
                 car_list,
@@ -981,8 +1041,18 @@ def _collect_brand_rows_in_page(page, base_selector: str, logger) -> list[dict[s
         logger.warning("페이지 내 트리 수집(evaluate) 실패: %s", e)
         return []
     if not res or not res.get("ok"):
+        logger.warning(
+            "브랜드 트리 DOM 기준(base) 없음 또는 실패: reason=%s",
+            (res or {}).get("reason", "unknown"),
+        )
         return []
-    return res.get("rows") or []
+    rows = res.get("rows") or []
+    if not rows and res.get("reason") == "no_depth1":
+        logger.warning(
+            "브랜드 트리에서 depth1(model-select__btn.depth1) 버튼이 0개입니다. "
+            "뷰포트/차단/페이지 구조 변경을 확인하세요."
+        )
+    return rows
 
 
 def run_kiacar_brand_list(page, result_dir: Path, logger, csv_path: Path | None = None) -> None:
@@ -1017,6 +1087,20 @@ def run_kiacar_brand_list(page, result_dir: Path, logger, csv_path: Path | None 
                 logger=logger,
                 attempts=3,
             )
+
+        _dismiss_popups_kiacar(page, logger)
+        try:
+            page.wait_for_selector(SELECTOR_BRAND_TREE_WAIT, timeout=25_000)
+        except Exception:
+            try:
+                page.wait_for_selector(".filter-info .model-select__btn.depth1", timeout=10_000)
+            except Exception:
+                logger.warning("기아 브랜드 트리(.model-select__btn.depth1) 로딩 대기 실패 — 수집을 계속합니다.")
+        page.wait_for_timeout(800)
+        try:
+            page.locator(".buy-carlist__left-side").first.scroll_into_view_if_needed(timeout=5000)
+        except Exception:
+            pass
 
         rows = _collect_brand_rows_in_page(page, SELECTOR_BASE, logger)
         if not rows:
@@ -1056,13 +1140,16 @@ def _extract_row_from_kiacar_card(li) -> dict[str, str]:
         "line_up": "",
         "release_dt": "",
         "car_navi": "",
+        "car_num": "",
         "price": "",
+        "underline": "",
         "discount": "",
         "badge_discount": "",
         "reserve": "",
     }
     try:
         cls = li.get_attribute("class") or ""
+        # li.item-card.is-pc.reserved.css-ozhxoy … → 예약중
         if "reserved" in cls and "css-ozhxoy" in cls:
             row["reserve"] = "예약중인 차량"
     except Exception:
@@ -1106,9 +1193,23 @@ def _extract_row_from_kiacar_card(li) -> dict[str, str]:
     except Exception:
         pass
     try:
+        el = li.locator(".css-8lid69 .plateNumber").first
+        if el.count() == 0:
+            el = li.locator(".plateNumber").first
+        if el.count() > 0:
+            row["car_num"] = _norm(el.inner_text())
+    except Exception:
+        pass
+    try:
         el = li.locator(".css-1sdsv7u .price").first
         if el.count() > 0:
             row["price"] = _norm(el.inner_text())
+    except Exception:
+        pass
+    try:
+        el = li.locator(".css-1sdsv7u .underline").first
+        if el.count() > 0:
+            row["underline"] = _norm(el.inner_text())
     except Exception:
         pass
     try:
@@ -1119,7 +1220,9 @@ def _extract_row_from_kiacar_card(li) -> dict[str, str]:
         pass
     try:
         if li.locator("[class*='img-wrap__discount']").count() > 0:
-            el = li.locator(".css-1u214re strong").first
+            el = li.locator("[class*='img-wrap__discount'] .css-1u214re strong").first
+            if el.count() == 0:
+                el = li.locator(".css-1u214re strong").first
             if el.count() > 0:
                 row["badge_discount"] = _norm(el.inner_text())
     except Exception:
@@ -1239,6 +1342,7 @@ def run_kiacar_list(
     if csv_path.exists():
         csv_path.unlink()
 
+    # 참조: kiacar_list_*.csv — car_name 단일 컬럼(차량 풀네임), car_num/underline 등 별도 컬럼 없음
     headers = [
         "model_sn",
         "product_id",
@@ -1324,7 +1428,9 @@ def run_kiacar_list(
                 model_sn += 1
 
                 date_crtr_pnttm, create_dt = _timestamps()
-                car_name = ((row.get("car_name_1") or "").strip() + " " + (row.get("car_name_2") or "").strip()).strip()
+                c1 = (row.get("car_name_1") or "").strip()
+                c2 = (row.get("car_name_2") or "").strip()
+                car_name = (c1 + " " + c2).strip()
                 match_key = _kiacar_car_name_to_match_key(row.get("car_name_1") or car_name)
                 matched = _kiacar_find_brand(match_key, brand_map) if match_key else None
 
@@ -1378,7 +1484,10 @@ def _run_kiacar_brand_csv(datst_cd: str, kwargs: dict[str, Any] | None = None) -
     csv_path = RESULT_DIR / f"kiacar_brand_list_{run_ts}.csv"
     with sync_playwright() as p:
         browser = _launch_browser(p, HEADLESS_MODE)
-        context = browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 800})
+        context = browser.new_context(
+            user_agent=USER_AGENT,
+            viewport={"width": 1440, "height": 900},
+        )
         install_route_blocking(context)
         page = context.new_page()
         try:

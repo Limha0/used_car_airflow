@@ -43,11 +43,13 @@ def heydealer_crawler():
     - 목록은 playwright로 사이트 크롤링 후 CSV/이미지 저장
     """
 
-    # PostgresHook 객체 생성
-    pg_hook = PostgresHook(postgres_conn_id="car_db_conn")
+   
 
     @task
     def insert_collect_data_info(**kwargs) -> dict[str, dict[str, Any]]:
+         # PostgresHook 객체 생성
+        pg_hook = PostgresHook(postgres_conn_id="car_db_conn")
+        
         """std.tn_data_bsc_info에서 헤이딜러(ps00002) 수집 대상 기본 정보 조회."""
         select_bsc_info_stmt = f"""
         SELECT * FROM std.tn_data_bsc_info tdbi
@@ -1567,6 +1569,32 @@ def _query_list_car_cards_snapshot(page) -> list[dict[str, str]]:
         return []
 
 
+def _get_list_cards_signature(page) -> str:
+    """
+    무한스크롤 로딩 판정을 위한 가벼운 시그니처.
+    - 카드 개수
+    - 마지막 카드 href
+    (scrollHeight가 늘지 않아도 카드가 교체/추가되는 케이스를 감지)
+    """
+    try:
+        return (
+            page.evaluate(
+                """
+                () => {
+                  const anchors = Array.from(document.querySelectorAll('a[href^="/market/cars/"]'));
+                  if (!anchors.length) return '0|';
+                  const last = anchors[anchors.length - 1];
+                  const href = ((last.getAttribute('href') || '').split('?')[0] || '').trim();
+                  return `${anchors.length}|${href}`;
+                }
+                """
+            )
+            or ""
+        )
+    except Exception:
+        return ""
+
+
 def _normalize_list_href(href: str) -> str:
     h = (href or "").strip().split("?")[0].rstrip("/")
     return h
@@ -1903,12 +1931,24 @@ def run_heydealer_job(
 
                 prev_collected_this_type = collected_this_type
                 last_height = page.evaluate("document.body.scrollHeight")
+                last_sig = _get_list_cards_signature(page)
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(1200)
+                # 고정 1.2초 대기 대신, "목록이 실제로 늘어날 때"까지만 짧게 폴링한다.
+                # 빠른 날엔 곧바로 다음 단계로 진행돼 전체 시간이 크게 줄어든다.
+                for _ in range(8):  # 최대 ~1.6초
+                    page.wait_for_timeout(200)
+                    try:
+                        if page.evaluate("document.body.scrollHeight") > last_height:
+                            break
+                        # scrollHeight 변화가 없어도 카드가 교체/추가될 수 있어 시그니처도 같이 본다.
+                        if _get_list_cards_signature(page) != last_sig:
+                            break
+                    except Exception:
+                        break
 
                 cards = _query_list_car_cards_snapshot(page)
                 if car_type_value and not cards and collected_this_type == 0:
-                    page.wait_for_timeout(1500)
+                    page.wait_for_timeout(300)
                     cards = _query_list_car_cards_snapshot(page)
                 current_snapshot_count = len(cards)
                 new_card_count = 0
@@ -1960,7 +2000,7 @@ def run_heydealer_job(
 
                 new_height = page.evaluate("document.body.scrollHeight")
                 if new_height == last_height:
-                    page.wait_for_timeout(1500)
+                    page.wait_for_timeout(300)
                     if page.evaluate("document.body.scrollHeight") == last_height:
                         if expected_count and collected_this_type < expected_count and no_new_rounds < 3:
                             run_logger.info(

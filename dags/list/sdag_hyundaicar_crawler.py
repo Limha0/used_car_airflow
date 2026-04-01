@@ -33,6 +33,7 @@ if str(_root) not in sys.path:
 
 from dto.tn_data_bsc_info import TnDataBscInfo
 from util.common_util import CommonUtil
+from util.playwright_util import GotoSpec, goto_with_retry
 
 
 USED_CAR_SITE_NAMES_VAR = "used_car_site_names"
@@ -714,9 +715,58 @@ def _reset_hyundaicar_filters(page, logger) -> bool:
 
 
 def _ensure_hyundaicar_search_page(page, logger) -> None:
+    """
+    certified.hyundai.com 검색 페이지가 DOM에 준비될 때까지 대기.
+    SPA·느린 네트워크·팝업으로 기본 visible만 대기하면 30초 초과가 날 수 있어
+    goto 재시도 + attached 우선 + 실패 시 reload로 완화한다.
+    """
+    spec = GotoSpec(
+        url=URL,
+        wait_until="domcontentloaded",
+        timeout_ms=120_000,
+        ready_selectors=(),
+        ready_timeout_ms=90_000,
+    )
     if URL not in (page.url or ""):
-        page.goto(URL, wait_until="domcontentloaded", timeout=90000)
-    page.wait_for_selector("#CPOwrap, #saleVehicleFilter", timeout=30000)
+        goto_with_retry(page, spec, logger=logger, attempts=3)
+    ready_join = ",".join(
+        [
+            "#CPOwrap",
+            "#saleVehicleFilter",
+            "li[data-ref='toggleBox']",
+            "[id*='saleVehicle']",
+        ]
+    )
+    dismiss_common_popups(page, logger)
+    page.wait_for_timeout(400)
+    for attempt in range(2):
+        try:
+            page.wait_for_selector(ready_join, state="attached", timeout=90_000)
+            break
+        except Exception as e:
+            logger.warning(
+                "현대차 검색 페이지 DOM 대기 실패(시도 %d/2): %s",
+                attempt + 1,
+                e,
+            )
+            if attempt == 0:
+                try:
+                    dismiss_common_popups(page, logger)
+                    page.reload(wait_until="domcontentloaded", timeout=120_000)
+                    page.wait_for_timeout(500)
+                    dismiss_common_popups(page, logger)
+                except Exception as re_e:
+                    logger.warning("reload 실패: %s", re_e)
+            else:
+                raise
+    try:
+        page.wait_for_selector(
+            "#CPOwrap, #saleVehicleFilter, #saleVehicleFilter li[data-ref='toggleBox']",
+            state="visible",
+            timeout=30_000,
+        )
+    except Exception:
+        logger.debug("필터 영역 visible 대기 생략(추출 단계에서 재시도)")
     page.wait_for_timeout(800)
     dismiss_common_popups(page, logger)
     try:
@@ -1605,10 +1655,14 @@ def run_hyundaicar_list_job(
     tags=["used_car", "hyundaicar", "crawler", "day"],
 )
 def hyundaicar_crawler_dag():
-    pg_hook = PostgresHook(postgres_conn_id="car_db_conn")
+    
 
     @task
     def insert_collect_data_info(**kwargs) -> dict[str, dict[str, Any]]:
+        
+        pg_hook = PostgresHook(postgres_conn_id="car_db_conn")
+        
+        """std.tn_data_bsc_info에서 현대차(ps00003) 수집 대상 기본 정보 조회."""
         select_bsc_info_stmt = f"""
         SELECT * FROM std.tn_data_bsc_info tdbi
         WHERE 1=1

@@ -1327,7 +1327,9 @@ def reborncar_crawler_dag():
 
     @task
     def insert_collect_data_info(**kwargs) -> dict[str, dict[str, Any]]:
+        
         hook = PostgresHook(postgres_conn_id="car_db_conn")
+
         site = REBORNCAR_PVSN_SITE_CD.lower().strip()
         sql = f"""
         SELECT * FROM std.tn_data_bsc_info
