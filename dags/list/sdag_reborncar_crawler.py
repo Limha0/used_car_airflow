@@ -1577,6 +1577,7 @@ def reborncar_crawler_dag():
     tn_data_clct_dtl_info_map = create_csv_process(infos)
     insert_csv_done = insert_csv_process(infos, tn_data_clct_dtl_info_map)
 
+    # NOTE(임시): 오늘 하루만 detail DAG 자동 트리거 비활성화
     trigger_reborncar_detail_crawl = TriggerDagRunOperator(
         task_id="trigger_reborncar_detail_crawl",
         trigger_dag_id="sdag_reborncar_detail_crawl",

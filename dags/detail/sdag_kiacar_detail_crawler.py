@@ -73,6 +73,7 @@ def kiacar_detail_crawl():
     def fetch_target_urls() -> list[dict[str, str]]:
         sql = f"""
         SELECT
+            model_sn,
             product_id,
             detail_url,
             register_flag
@@ -179,7 +180,9 @@ def kiacar_detail_crawl():
                     )
 
                 try:
-                    detail_data = _crawl_one(page, idx, product_id, detail_url, detail_img_dir)
+                    # model_sn은 "DB의 model_sn"이 아니라 "CSV에 실제로 기록되는 순번"으로 고정
+                    write_sn = collected + 1
+                    detail_data = _crawl_one(page, write_sn, product_id, detail_url, detail_img_dir)
                     if detail_data:
                         _save_to_csv_append(csv_path, DETAIL_CSV_FIELDS, detail_data)
                         collected += 1

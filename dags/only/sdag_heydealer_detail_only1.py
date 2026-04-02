@@ -24,7 +24,6 @@ from util.playwright_util import GotoSpec, goto_with_retry, images_enabled, inst
 #  상수
 # ═══════════════════════════════════════════════════════════════════
 SOURCE_LIST_TABLE    = "ods.ods_car_list_heydealer"
-TARGET_DETAIL_TABLE  = "ods.ods_car_detail_heydealer"
 FINAL_FILE_PATH_VAR  = "used_car_final_file_path"   # Airflow Variable 키
 IMAGE_FILE_PATH_VAR  = "used_car_image_file_path"   # 예: /home/limhayoung/data/img
 SITE_NAME            = "헤이딜러"
@@ -61,61 +60,39 @@ DETAIL_CSV_FIELDS = [
 # ═══════════════════════════════════════════════════════════════════
 
 @dag(
-    dag_id="sdag_heydealer_detail_crawl",
+    dag_id="sdag_heydealer_detail_only1",
     schedule=None,
     start_date=pendulum.datetime(2026, 3, 1, tz="Asia/Seoul"),
     catchup=False,
     tags=["used_car", "heydealer", "detail", "crawler"],
 )
 def heydealer_detail_crawl():
-    """헤이딜러 상세페이지 크롤링 DAG (register_flag = 'A' 신규만 → detail ODS 적재 후 list A→Y)."""
+    """헤이딜러 상세페이지 크롤링 DAG (register_flag != 'N' 전체). Task group으로 준비 → 크롤·저장 단계 분리."""
 
     # ── Task 1 : DB에서 수집 대상 조회 ────────────────────────────────────
     @task
     def fetch_target_urls() -> list[dict[str, str]]:
         """
         ods.ods_car_list_heydealer 에서
-        register_flag = 'A' 이고, data_crtr_pnttm 이 테이블 내 최신 적재일자와 같은 행만 조회한다.
-        (일자별로 쌓인 list 중 당일·최신 스냅샷만 상세 수집 대상으로 본다.)
+        register_flag != 'N' (NULL 포함) 인 product_id, detail_url 조회
         """
-        hook = PostgresHook(postgres_conn_id="car_db_conn")
-        _log_register_flag_distribution(hook, SOURCE_LIST_TABLE, "detail_수집_직전")
-
         sql = f"""
         SELECT
-            l.product_id,
-            l.detail_url,
-            l.register_flag
-        FROM {SOURCE_LIST_TABLE} l
-        WHERE TRIM(COALESCE(l.register_flag, '')) = 'A'
-          AND l.detail_url IS NOT NULL
-          AND TRIM(l.detail_url) != ''
-          AND l."data_crtr_pnttm" IS NOT NULL
-          AND l."data_crtr_pnttm" = (
-              SELECT MAX(m."data_crtr_pnttm")
-              FROM {SOURCE_LIST_TABLE} m
-              WHERE m."data_crtr_pnttm" IS NOT NULL
-          )
-        ORDER BY l.model_sn
+            product_id,
+            detail_url,
+            register_flag
+        FROM {SOURCE_LIST_TABLE}
+        WHERE (register_flag IS NULL OR TRIM(register_flag) != 'N')
+          AND detail_url IS NOT NULL
+          AND TRIM(detail_url) != ''
+        ORDER BY model_sn
         """
         logging.info("select_target_urls_stmt ::: %s", sql)
+        hook = PostgresHook(postgres_conn_id="car_db_conn")
         conn = hook.get_conn()
         rows = []
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT MAX(m."data_crtr_pnttm")
-                    FROM {SOURCE_LIST_TABLE} m
-                    WHERE m."data_crtr_pnttm" IS NOT NULL
-                    """
-                )
-                max_row = cur.fetchone()
-                latest_pnttm = max_row[0] if max_row else None
-                logging.info(
-                    "헤이딜러 detail 수집 기준 data_crtr_pnttm(최신): %s",
-                    latest_pnttm,
-                )
                 cur.execute(sql)
                 cols = [d[0] for d in cur.description]
                 for row in cur.fetchall():
@@ -268,42 +245,6 @@ def heydealer_detail_crawl():
 
         return str(csv_path)
 
-    @task
-    def load_detail_csv_to_ods(csv_path: str) -> dict[str, Any]:
-        """
-        crawl_and_save_csv 결과 CSV를 ods.ods_car_detail_heydealer로 적재.
-        - 테이블 컬럼 기준으로 CSV 컬럼을 자동 필터링
-        - truncate 없이 append insert
-        - 적재 후 list 테이블에서 해당 product_id의 register_flag를 A→Y로 갱신
-        """
-        p = Path(str(csv_path or ""))
-        if not p.is_file():
-            raise FileNotFoundError(f"적재 대상 CSV가 없습니다: {p}")
-
-        rows = _read_csv_rows(p)
-        if not rows:
-            raise ValueError(f"적재할 CSV 데이터가 없습니다: {p}")
-
-        hook = PostgresHook(postgres_conn_id="car_db_conn")
-        _bulk_insert_rows(hook, TARGET_DETAIL_TABLE, rows, truncate=False, allow_only_table_cols=True)
-        _mark_heydealer_list_rows_processed(hook, SOURCE_LIST_TABLE, rows)
-        _log_register_flag_distribution(hook, SOURCE_LIST_TABLE, "detail_ODS적재_list갱신_후")
-        table_count = CommonUtil.get_table_row_count(hook, TARGET_DETAIL_TABLE)
-        logging.info(
-            "헤이딜러 detail CSV 적재 완료: table=%s, inserted_rows=%d, table_count=%d, csv=%s",
-            TARGET_DETAIL_TABLE,
-            len(rows),
-            table_count,
-            p,
-        )
-        return {
-            "done": True,
-            "target_table": TARGET_DETAIL_TABLE,
-            "row_count": len(rows),
-            "table_count": table_count,
-            "csv_path": str(p),
-        }
-
     @task_group(group_id="prepare_detail_crawl")
     def prepare_detail_crawl():
         """1단계: DB에서 대상 조회 → 건수 요약."""
@@ -316,8 +257,7 @@ def heydealer_detail_crawl():
         return crawl_and_save_csv(target_rows)
 
     prepared = prepare_detail_crawl()
-    csv_path = crawl_and_persist(prepared)
-    load_detail_csv_to_ods(csv_path)
+    crawl_and_persist(prepared)
 
 
 dag_object = heydealer_detail_crawl()
@@ -405,160 +345,6 @@ def _save_to_csv_append(file_path: Path, fieldnames: list[str], data: dict[str, 
         if not file_exists:
             writer.writeheader()
         writer.writerow(row)
-
-
-def _read_csv_rows(csv_path: Path) -> list[dict[str, Any]]:
-    if not csv_path.exists():
-        return []
-    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
-        return [dict(r) for r in csv.DictReader(f)]
-
-
-def _split_schema_table(full_name: str) -> tuple[str, str]:
-    if "." in full_name:
-        schema, table = full_name.split(".", 1)
-        return schema.strip(), table.strip()
-    return "public", full_name.strip()
-
-
-def _get_table_columns(hook: PostgresHook, full_table_name: str) -> list[str]:
-    schema, table = _split_schema_table(full_table_name)
-    sql = """
-    SELECT column_name
-    FROM information_schema.columns
-    WHERE table_schema = %s
-      AND table_name = %s
-    ORDER BY ordinal_position
-    """
-    rows = hook.get_records(sql, parameters=(schema, table))
-    return [r[0] for r in rows]
-
-
-def _bulk_insert_rows(
-    hook: PostgresHook,
-    full_table_name: str,
-    rows: list[dict[str, Any]],
-    *,
-    truncate: bool = False,
-    allow_only_table_cols: bool = True,
-) -> None:
-    if not rows:
-        return
-
-    table_cols = _get_table_columns(hook, full_table_name) if allow_only_table_cols else []
-    table_col_set = set(table_cols)
-
-    candidate_cols: list[str] = []
-    for row in rows:
-        for key in row.keys():
-            if key not in candidate_cols:
-                candidate_cols.append(key)
-
-    insert_cols = [c for c in candidate_cols if c in table_col_set] if table_cols else candidate_cols
-    if not insert_cols:
-        raise ValueError(f"insert 가능한 컬럼이 없습니다. table={full_table_name}")
-
-    values = [tuple(row.get(col) for col in insert_cols) for row in rows]
-
-    conn = hook.get_conn()
-    try:
-        with conn.cursor() as cur:
-            if truncate:
-                cur.execute(f"TRUNCATE TABLE {full_table_name}")
-
-            from psycopg2.extras import execute_values
-
-            cols_sql = ", ".join([f'"{col}"' for col in insert_cols])
-            sql = f"INSERT INTO {full_table_name} ({cols_sql}) VALUES %s"
-            execute_values(cur, sql, values, page_size=2000)
-        conn.commit()
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
-def _mark_heydealer_list_rows_processed(
-    hook: PostgresHook,
-    source_list_table: str,
-    detail_rows: list[dict[str, Any]],
-    *,
-    key_col: str = "product_id",
-    flag_col: str = "register_flag",
-) -> int:
-    """
-    detail 적재 성공 후, 해당 list row의 register_flag를 'Y'로 표시.
-    register_flag가 'A'이면서 data_crtr_pnttm이 테이블 전체 최신값인 행만 갱신한다.
-    (상세 수집 대상 조회와 동일한 스냅샷 기준)
-    """
-    product_ids = sorted({str(r.get(key_col) or "").strip() for r in detail_rows if str(r.get(key_col) or "").strip()})
-    if not product_ids:
-        return 0
-
-    conn = hook.get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                UPDATE {source_list_table} u
-                SET "{flag_col}" = 'Y'
-                WHERE u."{key_col}" = ANY(%s)
-                  AND TRIM(COALESCE(u."{flag_col}", '')) = 'A'
-                  AND u."data_crtr_pnttm" IS NOT NULL
-                  AND u."data_crtr_pnttm" = (
-                      SELECT MAX(m."data_crtr_pnttm")
-                      FROM {source_list_table} m
-                      WHERE m."data_crtr_pnttm" IS NOT NULL
-                  )
-                """,
-                (product_ids,),
-            )
-            updated = int(cur.rowcount or 0)
-        conn.commit()
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-    logging.info("헤이딜러 list register_flag 처리완료 업데이트: updated=%d", updated)
-    return updated
-
-
-def _log_register_flag_distribution(hook: PostgresHook, table: str, context: str) -> dict[str, int]:
-    """register_flag별 건수 로깅 (검증용: Y / N / A / 기타)."""
-    sql = f"""
-    SELECT
-      CASE
-        WHEN TRIM(COALESCE(register_flag, '')) = 'Y' THEN 'Y'
-        WHEN TRIM(COALESCE(register_flag, '')) = 'N' THEN 'N'
-        WHEN TRIM(COALESCE(register_flag, '')) = 'A' THEN 'A'
-        ELSE '기타'
-      END AS bucket,
-      COUNT(*)::bigint
-    FROM {table}
-    GROUP BY 1
-    """
-    recs = hook.get_records(sql) or []
-    counts: dict[str, int] = {"Y": 0, "N": 0, "A": 0, "기타": 0}
-    for bucket, cnt in recs:
-        k = str(bucket or "기타")
-        if k in counts:
-            counts[k] += int(cnt or 0)
-        else:
-            counts["기타"] += int(cnt or 0)
-    total = sum(counts.values())
-    logging.info(
-        "register_flag 집계 [%s] table=%s | Y:%d, N:%d, A:%d, 기타:%d, 합계:%d",
-        context,
-        table,
-        counts["Y"],
-        counts["N"],
-        counts["A"],
-        counts["기타"],
-        total,
-    )
-    return counts
 
 
 # ═══════════════════════════════════════════════════════════════════

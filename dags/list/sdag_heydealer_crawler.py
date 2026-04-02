@@ -245,6 +245,7 @@ def heydealer_crawler():
             sync_result["marked_missing_count"],
             sync_result["source_count"],
         )
+        _log_register_flag_distribution(hook, source_table, "list_sync_tmp_source_후")
         return {
             "done": True,
             "tmp_table": tmp_table,
@@ -300,6 +301,7 @@ def heydealer_crawler():
     infos = insert_collect_data_info()
     tn_data_clct_dtl_info_map = create_csv_process(infos)
     insert_csv_done = insert_csv_process(infos, tn_data_clct_dtl_info_map)
+    # NOTE(임시): 오늘 하루만 detail DAG 자동 트리거 비활성화
     trigger_heydealer_detail_crawl = TriggerDagRunOperator(
         task_id="trigger_heydealer_detail_crawl",
         trigger_dag_id="sdag_heydealer_detail_crawl",
@@ -2055,6 +2057,42 @@ def run_heydealer_job(
         "count": len(raw_list),
         "log_file": str(LOG_FILE),
     }
+
+
+def _log_register_flag_distribution(hook: PostgresHook, table: str, context: str) -> dict[str, int]:
+    """register_flag별 건수 로깅 (검증용: Y / N / A / 기타)."""
+    sql = f"""
+    SELECT
+      CASE
+        WHEN TRIM(COALESCE(register_flag, '')) = 'Y' THEN 'Y'
+        WHEN TRIM(COALESCE(register_flag, '')) = 'N' THEN 'N'
+        WHEN TRIM(COALESCE(register_flag, '')) = 'A' THEN 'A'
+        ELSE '기타'
+      END AS bucket,
+      COUNT(*)::bigint
+    FROM {table}
+    GROUP BY 1
+    """
+    recs = hook.get_records(sql) or []
+    counts: dict[str, int] = {"Y": 0, "N": 0, "A": 0, "기타": 0}
+    for bucket, cnt in recs:
+        k = str(bucket or "기타")
+        if k in counts:
+            counts[k] += int(cnt or 0)
+        else:
+            counts["기타"] += int(cnt or 0)
+    total = sum(counts.values())
+    logging.info(
+        "register_flag 집계 [%s] table=%s | Y:%d, N:%d, A:%d, 기타:%d, 합계:%d",
+        context,
+        table,
+        counts["Y"],
+        counts["N"],
+        counts["A"],
+        counts["기타"],
+        total,
+    )
+    return counts
 
 
 def _sync_tmp_and_source_register_flag(

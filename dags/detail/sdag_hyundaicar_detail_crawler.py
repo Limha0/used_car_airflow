@@ -81,20 +81,26 @@ DETAIL_CSV_FIELDS = [
     tags=["used_car", "hyundaicar", "detail", "crawler"],
 )
 def hyundaicar_detail_crawl():
-    """현대차 인증중고차 상세페이지 크롤링 DAG (register_flag = 'A' 신규만)."""
+    """현대차 인증중고차 상세페이지 크롤링 DAG (register_flag = 'A' 신규, 최신 data_crtr_pnttm 배치만)."""
 
     @task
     def fetch_target_urls() -> list[dict[str, str]]:
         sql = f"""
         SELECT
-            product_id,
-            detail_url,
-            register_flag
-        FROM {SOURCE_LIST_TABLE}
-        WHERE TRIM(COALESCE(register_flag, '')) = 'A'
-          AND detail_url IS NOT NULL
-          AND TRIM(detail_url) != ''
-        ORDER BY model_sn
+            l.product_id,
+            l.detail_url,
+            l.register_flag
+        FROM {SOURCE_LIST_TABLE} l
+        WHERE TRIM(COALESCE(l.register_flag, '')) = 'A'
+          AND l.detail_url IS NOT NULL
+          AND TRIM(l.detail_url) != ''
+          AND l."data_crtr_pnttm" IS NOT NULL
+          AND l."data_crtr_pnttm" = (
+              SELECT MAX(m."data_crtr_pnttm")
+              FROM {SOURCE_LIST_TABLE} m
+              WHERE m."data_crtr_pnttm" IS NOT NULL
+          )
+        ORDER BY l.model_sn
         """
         logging.info("select_target_urls_stmt ::: %s", sql)
         hook = PostgresHook(postgres_conn_id="car_db_conn")
@@ -102,6 +108,19 @@ def hyundaicar_detail_crawl():
         rows: list[dict[str, str]] = []
         try:
             with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT MAX(m."data_crtr_pnttm")
+                    FROM {SOURCE_LIST_TABLE} m
+                    WHERE m."data_crtr_pnttm" IS NOT NULL
+                    """
+                )
+                max_row = cur.fetchone()
+                latest_pnttm = max_row[0] if max_row else None
+                logging.info(
+                    "현대차 detail 수집 기준 data_crtr_pnttm(최신): %s",
+                    latest_pnttm,
+                )
                 cur.execute(sql)
                 cols = [d[0] for d in cur.description]
                 for row in cur.fetchall() or []:
@@ -479,10 +498,8 @@ def _mark_hyundaicar_list_rows_processed(
     flag_col: str = "register_flag",
 ) -> int:
     """
-    detail 적재 성공 후, 해당 list row의 register_flag를 'Y'로 표시해
-    'A'가 남아서 반복 수집되는 문제를 방지한다.
-    - CSV에 product_id가 없는 행은 무시
-    - register_flag가 'A'인 건만 'Y'로 변경(다른 상태는 건드리지 않음)
+    detail 적재 성공 후, 해당 list row의 register_flag를 'Y'로 표시한다.
+    register_flag가 'A'이면서 data_crtr_pnttm이 테이블 전체 최신값인 행만 갱신한다.
     """
     product_ids = sorted({str(r.get(key_col) or "").strip() for r in detail_rows if str(r.get(key_col) or "").strip()})
     if not product_ids:
@@ -493,10 +510,16 @@ def _mark_hyundaicar_list_rows_processed(
         with conn.cursor() as cur:
             cur.execute(
                 f"""
-                UPDATE {source_list_table}
+                UPDATE {source_list_table} u
                 SET "{flag_col}" = 'Y'
-                WHERE "{key_col}" = ANY(%s)
-                  AND TRIM(COALESCE("{flag_col}", '')) = 'A'
+                WHERE u."{key_col}" = ANY(%s)
+                  AND TRIM(COALESCE(u."{flag_col}", '')) = 'A'
+                  AND u."data_crtr_pnttm" IS NOT NULL
+                  AND u."data_crtr_pnttm" = (
+                      SELECT MAX(m."data_crtr_pnttm")
+                      FROM {source_list_table} m
+                      WHERE m."data_crtr_pnttm" IS NOT NULL
+                  )
                 """,
                 (product_ids,),
             )

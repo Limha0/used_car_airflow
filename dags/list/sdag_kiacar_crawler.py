@@ -1234,12 +1234,17 @@ def _download_kiacar_card_first_img(page, li, save_dir: Path, file_stem: str, lo
     save_dir.mkdir(parents=True, exist_ok=True)
     out_path = save_dir / f"{file_stem}.png"
     selectors = [
-        "div.img-wrap__discount.css-kn97bq a[rel='noopener noreferrer'] img.item-card__img",
-        "div.css-kn97bq a[rel='noopener noreferrer'] img.item-card__img",
-        "div.img-wrap__discount.css-kn97bq a[rel='noopener noreferrer'] img",
-        "div.css-kn97bq a[rel='noopener noreferrer'] img",
-        "a[rel='noopener noreferrer'] img.item-card__img",
-        "a[rel='noopener noreferrer'] img",
+        # 요청하신 케이스(카드 내 첫 img):
+        # 1) .img-wrap__discount ... a[rel] ... img.item-card__img...
+        "div.img-wrap__discount a[rel='noopener noreferrer'] img[class*='item-card__img']",
+        # 2) .css-kn97bq ... a[rel] ... img.item-card__img...
+        "div.css-kn97bq a[rel='noopener noreferrer'] img[class*='item-card__img']",
+        # 3) a[rel] 하위 img.item-card__img...
+        "a[rel='noopener noreferrer'] img[class*='item-card__img']",
+        # 4) 카드 내부에서 item-card__img 계열 (reserved/css-s13p8 포함)
+        "img[class*='item-card__img']",
+        # 최후 fallback: 카드 내부 첫 img
+        "img",
     ]
 
     img_src = ""
@@ -1248,13 +1253,38 @@ def _download_kiacar_card_first_img(page, li, save_dir: Path, file_stem: str, lo
             img = li.locator(sel).first
             if img.count() == 0:
                 continue
-            img_src = (img.get_attribute("src") or "").strip() or (img.get_attribute("data-src") or "").strip()
+            img_src = (
+                (img.get_attribute("src") or "").strip()
+                or (img.get_attribute("data-src") or "").strip()
+                or (img.get_attribute("srcset") or "").strip()
+                or (img.get_attribute("data-srcset") or "").strip()
+            )
             if img_src:
                 break
         except Exception:
             continue
     if not img_src:
+        # evaluate fallback: currentSrc (lazy-load 대응)
+        try:
+            img_src = li.evaluate(
+                """el => {
+                  const img = el.querySelector('img');
+                  if (!img) return '';
+                  return (img.currentSrc || img.src || img.getAttribute('data-src') || '').trim();
+                }"""
+            ) or ""
+        except Exception:
+            img_src = ""
+    if not img_src:
         return ""
+
+    # srcset인 경우 첫 URL만 추출
+    if "," in img_src or " " in img_src:
+        try:
+            first = img_src.split(",")[0].strip()
+            img_src = first.split(" ")[0].strip() if first else img_src
+        except Exception:
+            pass
 
     img_url = img_src if img_src.startswith("http") else urljoin(page.url or URL, img_src)
     try:
@@ -1434,6 +1464,10 @@ def run_kiacar_list(
                 match_key = _kiacar_car_name_to_match_key(row.get("car_name_1") or car_name)
                 matched = _kiacar_find_brand(match_key, brand_map) if match_key else None
 
+                try:
+                    li.scroll_into_view_if_needed(timeout=3000)
+                except Exception:
+                    pass
                 car_imgs = _download_kiacar_card_first_img(page, li, list_save_dir, f"{pid}_list", logger) or ""
                 w.writerow(
                     {
