@@ -1,3 +1,8 @@
+# -*- coding: utf-8 -*-
+"""
+리본카 스마트바이 목록 수집 → ODS·tmp→원천 동기화 후 sdag_reborncar_detail_crawl 트리거.
+목록 썸네일: {연도}년/리본카/list/{product_id}/{product_id}_list.png (Variable used_car_image_file_path).
+"""
 import csv
 import logging
 import re
@@ -177,6 +182,12 @@ try:
     activate_paths_for_datst(REBORNCAR_DATST_LIST)
 except Exception:
     pass
+
+
+def _reborncar_list_image_relpath(product_id: str) -> str:
+    """Variable 이미지 루트 기준: {연도}년/리본카/list/{product_id}/{product_id}_list.png."""
+    site = get_site_name_by_datst(REBORNCAR_DATST_LIST)
+    return f"{YEAR_STR}/{site}/list/{product_id}/{product_id}_list.png"
 
 
 def _normalize_target_table(raw: str | None) -> str | None:
@@ -880,11 +891,12 @@ def run_reborncar_car_type_to_path(page, result_path: Path, logger, pnttm: str |
         logger.error(f"차종 수집 오류: {e}")
 
 def save_list_thumbnail(item_locator, page, product_id, save_dir, list_page_url, logger):
-    """목록 아이템의 .lp-thumnail > img 를 product_id_list.png 로 저장. 저장 경로(imgs부터) 반환."""
+    """목록 .lp-thumnail > img → list/{product_id}/{product_id}_list.png. 상대경로(imgs 기준) 반환."""
     if not product_id or not save_dir:
         return ""
     save_dir = Path(save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
+    product_dir = save_dir / product_id
+    product_dir.mkdir(parents=True, exist_ok=True)
     base_url = list_page_url.rsplit("?", 1)[0] if "?" in list_page_url else list_page_url
     img_el = item_locator.locator(".lp-thumnail img").first
     if img_el.count() == 0:
@@ -896,20 +908,21 @@ def save_list_thumbnail(item_locator, page, product_id, save_dir, list_page_url,
         full_url = urljoin(base_url, src) if not (src.startswith("http") or src.startswith("//")) else ("https:" + src if src.startswith("//") else src)
         resp = page.request.get(full_url)
         if resp.ok:
-            path = save_dir / f"{product_id}_list.png"
+            path = product_dir / f"{product_id}_list.png"
             path.write_bytes(resp.body())
-            return str(path)
+            return _reborncar_list_image_relpath(product_id)
     except Exception as e:
         logger.warning(f"리스트 썸네일 저장 실패 ({product_id}_list): {e}")
     return ""
 
 
 def save_detail_images(page, product_id, save_dir, detail_url, logger):
-    """상세 페이지 vip-visual 영역 이미지를 product_id_1.png, product_id_2.png ... 로 저장."""
+    """상세 vip-visual 이미지를 detail/{product_id}/{product_id}_1.png … 로 저장."""
     if not product_id or not save_dir:
         return
     save_dir = Path(save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
+    product_dir = save_dir / product_id
+    product_dir.mkdir(parents=True, exist_ok=True)
     base_url = detail_url.rsplit("?", 1)[0] if "?" in detail_url else detail_url
     urls = []
     # 1) #wrap .vip-section .vip-visual .vip-visual-detail .visual-detail .detail-img 내 이미지
@@ -943,7 +956,7 @@ def save_detail_images(page, product_id, save_dir, detail_url, logger):
             full_url = urljoin(base_url, src) if not (src.startswith("http") or src.startswith("//")) else ("https:" + src if src.startswith("//") else src)
             resp = page.request.get(full_url)
             if resp.ok:
-                path = save_dir / f"{product_id}_{idx}.png"
+                path = product_dir / f"{product_id}_{idx}.png"
                 path.write_bytes(resp.body())
                 # logger.info(f"이미지 저장: {path}")
                 saved_count += 1
@@ -1216,9 +1229,13 @@ def run_reborncar_list_job(
                                         full_url = urljoin(base_url, src) if not (src.startswith("http") or src.startswith("//")) else ("https:" + src if src.startswith("//") else src)
                                         resp = page.request.get(full_url)
                                         if resp.ok:
-                                            path = list_img_save_dir / f"{v_product_id}_list.png"
+                                            pdir = list_img_save_dir / v_product_id
+                                            pdir.mkdir(parents=True, exist_ok=True)
+                                            path = pdir / f"{v_product_id}_list.png"
                                             path.write_bytes(resp.body())
-                                            car_imgs_val = str(path)
+                                            car_imgs_val = _reborncar_list_image_relpath(
+                                                v_product_id
+                                            )
 
                             car_name_val = _normalize_composite_key(v_lp_car_name, v_lp_car_trim)
                             list_row = {
@@ -1577,11 +1594,16 @@ def reborncar_crawler_dag():
     tn_data_clct_dtl_info_map = create_csv_process(infos)
     insert_csv_done = insert_csv_process(infos, tn_data_clct_dtl_info_map)
 
-    # NOTE(임시): 오늘 하루만 detail DAG 자동 트리거 비활성화
     trigger_reborncar_detail_crawl = TriggerDagRunOperator(
         task_id="trigger_reborncar_detail_crawl",
         trigger_dag_id="sdag_reborncar_detail_crawl",
         wait_for_completion=False,
+        reset_dag_run=True,
+        conf={
+            "source_dag_id": "sdag_reborncar_crawler",
+            "source_run_id": "{{ run_id }}",
+            "source_logical_date": "{{ ds }}",
+        },
     )
     insert_csv_done >> trigger_reborncar_detail_crawl
 

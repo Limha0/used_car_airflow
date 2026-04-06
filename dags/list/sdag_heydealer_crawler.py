@@ -40,7 +40,7 @@ def heydealer_crawler():
 
     - DB 메타(std.tn_data_bsc_info, ps00002 data4/5/6) 조회
     - 브랜드/차종은 API로 CSV 생성
-    - 목록은 playwright로 사이트 크롤링 후 CSV/이미지 저장
+    - 목록은 playwright로 크롤링; 이미지는 목록 썸네일 1장(`list/{product_id}/{product_id}_list.png`)만.
     """
 
    
@@ -1455,56 +1455,65 @@ def get_today_img_rel_dir():
     return IMG_LIST_REL
 
 
-def download_list_image(img_url, product_id):
-    """상품 대표 이미지 1장만 다운로드 → product_id_list.png. 성공 시 절대 경로 반환, 실패 시 ""."""
+def _normalize_heydealer_list_image_url(raw: str) -> str:
+    """목록 썸네일 URL을 requests/Playwright GET 가능한 절대 URL로 만든다."""
+    u = (raw or "").strip()
+    if not u or "svg" in u.lower():
+        return ""
+    if u.startswith("//"):
+        return "https:" + u
+    if u.startswith("/"):
+        return "https://www.heydealer.com" + u
+    return u
+
+
+def download_list_image(img_url, product_id, *, api_request=None):
+    """
+    상품 대표 이미지 1장만 다운로드 → list/{product_id}/{product_id}_list.png.
+    api_request: Playwright BrowserContext.request (목록 수집과 동일 쿠키·세션으로 CDN 요청 권장).
+    성공 시 절대 경로 반환, 실패 시 "".
+    """
+    url = _normalize_heydealer_list_image_url(img_url)
+    if not product_id or not url:
+        return ""
+    product_dir = (IMG_BASE / "list") / product_id
+    product_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{product_id}_list.png"
+    save_path = product_dir / filename
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Referer": "https://www.heydealer.com/",
+    }
     try:
-        if not img_url or "svg" in img_url.lower():
-            return ""
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Referer": "https://www.heydealer.com",
-        }
-        response = requests.get(img_url, stream=True, timeout=15, headers=headers)
+        if api_request is not None:
+            resp = api_request.get(url, timeout=30_000, headers=headers)
+            if resp.status != 200:
+                logging.warning(
+                    "목록 이미지 HTTP %s product_id=%s url=%s",
+                    resp.status,
+                    product_id,
+                    url[:160],
+                )
+                return ""
+            save_path.write_bytes(resp.body())
+            return str(save_path.resolve())
+        response = requests.get(url, stream=True, timeout=20, headers=headers)
         if response.status_code != 200:
+            logging.warning(
+                "목록 이미지 HTTP %s product_id=%s url=%s",
+                response.status_code,
+                product_id,
+                url[:160],
+            )
             return ""
-        # 예: /home/limhayoung/data/img/2026년/리본카/20260317/list
-        save_dir = IMG_BASE / "list"
-        save_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{product_id}_list.png"
-        save_path = save_dir / filename
         with open(save_path, "wb") as f:
             for chunk in response.iter_content(1024):
                 f.write(chunk)
-        return str((Path(get_today_img_rel_dir()) / filename).resolve())
-    except Exception:
+        return str(save_path.resolve())
+    except Exception as e:
+        logging.warning("목록 이미지 저장 실패 product_id=%s url=%s err=%s", product_id, url[:120], e)
         return ""
 
-
-def download_image(img_url, product_id, idx):
-    """이미지 다운로드. 저장 경로: imgs/heydealer/연도/YYYYMMDD/product_id_idx.ext"""
-    try:
-        if not img_url or "svg" in img_url.lower():
-            return False
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Referer": "https://www.heydealer.com",
-        }
-        response = requests.get(img_url, stream=True, timeout=15, headers=headers)
-        if response.status_code != 200:
-            return False
-        ext = img_url.split(".")[-1].split("?")[0].lower()
-        if len(ext) > 4 or len(ext) < 2:
-            ext = "jpg"
-        save_dir = IMG_BASE
-        save_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{product_id}_{idx}.{ext}"
-        save_path = save_dir / filename
-        with open(save_path, "wb") as f:
-            for chunk in response.iter_content(1024):
-                f.write(chunk)
-        return True
-    except Exception:
-        return False
 
 def _query_list_car_cards_snapshot(page) -> list[dict[str, str]]:
     """
@@ -1541,10 +1550,33 @@ def _query_list_car_cards_snapshot(page) -> list[dict[str, str]]:
 
                   let listImageUrl = '';
                   for (const img of Array.from(el.querySelectorAll('img'))) {
-                    const src = ((img.getAttribute('src') || img.getAttribute('data-src') || '') + '').trim();
+                    let src = '';
+                    try {
+                      src = ((img.currentSrc || '') + '').trim();
+                    } catch (e) {}
+                    if (!src) {
+                      src = (
+                        (img.getAttribute('src') ||
+                          img.getAttribute('data-src') ||
+                          img.getAttribute('data-lazy-src') ||
+                          img.getAttribute('data-original') ||
+                          '') + ''
+                      ).trim();
+                    }
+                    if (!src) {
+                      const ss = ((img.getAttribute('srcset') || '') + '').trim();
+                      if (ss) {
+                        const first = ss.split(',')[0].trim().split(/\\s+/)[0];
+                        if (first) src = first;
+                      }
+                    }
                     if (!src || src.toLowerCase().includes('svg')) continue;
                     if (!listImageUrl) listImageUrl = src;
-                    if (src.includes('image.heydealer.com') || src.includes('heydealer.com')) {
+                    if (
+                      src.includes('image.heydealer.com') ||
+                      src.includes('cdn.heydealer') ||
+                      src.includes('heydealer.com')
+                    ) {
                       listImageUrl = src;
                       break;
                     }
@@ -2042,9 +2074,16 @@ def run_heydealer_job(
                 list_image_url = (item.get("list_image_url") or "").strip()
 
                 if list_image_url:
-                    car_imgs_path = download_list_image(list_image_url, product_id)
+                    car_imgs_path = download_list_image(
+                        list_image_url, product_id, api_request=context.request
+                    )
                     if car_imgs_path:
                         item["car_imgs"] = car_imgs_path
+                elif product_id and idx <= 10:
+                    run_logger.warning(
+                        "[2단계] list_image_url 없음 → car_imgs 스킵 (스냅샷 DOM 확인) product_id=%s",
+                        product_id,
+                    )
             run_logger.info("[2단계] 목록 이미지 수집 완료 (%d건 처리)", total_rows)
 
         rewrite_csv_atomic(LIST_FILE, list_fields, raw_list)

@@ -28,6 +28,7 @@ TARGET_DETAIL_TABLE  = "ods.ods_car_detail_heydealer"
 FINAL_FILE_PATH_VAR  = "used_car_final_file_path"   # Airflow Variable 키
 IMAGE_FILE_PATH_VAR  = "used_car_image_file_path"   # 예: /home/limhayoung/data/img
 SITE_NAME            = "헤이딜러"
+# 상세 갤러리 이미지 경로·저장은 본 DAG만 담당. 목록 썸네일({product_id}_list.png)은 list DAG.
 
 DETAIL_CSV_FIELDS = [
     "model_sn",
@@ -68,14 +69,14 @@ DETAIL_CSV_FIELDS = [
     tags=["used_car", "heydealer", "detail", "crawler"],
 )
 def heydealer_detail_crawl():
-    """헤이딜러 상세페이지 크롤링 DAG (register_flag = 'A' 신규만 → detail ODS 적재 후 list A→Y)."""
+    """헤이딜러 상세: register_flag='A' 만 수집 → CSV 한 줄마다 List complete_yn Y/N, 이후 Detail 적재·동기화. Reg_Flag 는 List DAG 전용."""
 
     # ── Task 1 : DB에서 수집 대상 조회 ────────────────────────────────────
     @task
     def fetch_target_urls() -> list[dict[str, str]]:
         """
         ods.ods_car_list_heydealer 에서
-        register_flag = 'A' 이고, data_crtr_pnttm 이 테이블 내 최신 적재일자와 같은 행만 조회한다.
+        register_flag = 'A' 이고, date_crtr_pnttm 이 테이블 내 최신 적재일자와 같은 행만 조회한다.
         (일자별로 쌓인 list 중 당일·최신 스냅샷만 상세 수집 대상으로 본다.)
         """
         hook = PostgresHook(postgres_conn_id="car_db_conn")
@@ -90,36 +91,74 @@ def heydealer_detail_crawl():
         WHERE TRIM(COALESCE(l.register_flag, '')) = 'A'
           AND l.detail_url IS NOT NULL
           AND TRIM(l.detail_url) != ''
-          AND l."data_crtr_pnttm" IS NOT NULL
-          AND l."data_crtr_pnttm" = (
-              SELECT MAX(m."data_crtr_pnttm")
+          AND l."date_crtr_pnttm" IS NOT NULL
+          AND l."date_crtr_pnttm" = (
+              SELECT MAX(m."date_crtr_pnttm")
               FROM {SOURCE_LIST_TABLE} m
-              WHERE m."data_crtr_pnttm" IS NOT NULL
+              WHERE m."date_crtr_pnttm" IS NOT NULL
           )
         ORDER BY l.model_sn
         """
         logging.info("select_target_urls_stmt ::: %s", sql)
         conn = hook.get_conn()
-        rows = []
+        rows: list[dict[str, str]] = []
+        latest_pnttm = None
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    SELECT MAX(m."data_crtr_pnttm")
+                    SELECT MAX(m."date_crtr_pnttm")
                     FROM {SOURCE_LIST_TABLE} m
-                    WHERE m."data_crtr_pnttm" IS NOT NULL
+                    WHERE m."date_crtr_pnttm" IS NOT NULL
                     """
                 )
                 max_row = cur.fetchone()
                 latest_pnttm = max_row[0] if max_row else None
                 logging.info(
-                    "헤이딜러 detail 수집 기준 data_crtr_pnttm(최신): %s",
+                    "헤이딜러 detail 수집 기준 date_crtr_pnttm(최신): %s",
                     latest_pnttm,
                 )
                 cur.execute(sql)
                 cols = [d[0] for d in cur.description]
                 for row in cur.fetchall():
                     rows.append(dict(zip(cols, row)))
+
+                if not rows and latest_pnttm is not None:
+                    cur.execute(
+                        f"""
+                        SELECT
+                            COUNT(*) AS total_latest,
+                            COUNT(*) FILTER (
+                                WHERE TRIM(COALESCE(register_flag, '')) = 'A'
+                            ) AS cnt_a,
+                            COUNT(*) FILTER (
+                                WHERE detail_url IS NOT NULL AND TRIM(detail_url) <> ''
+                            ) AS cnt_url
+                        FROM {SOURCE_LIST_TABLE}
+                        WHERE "date_crtr_pnttm" = %s
+                        """,
+                        (latest_pnttm,),
+                    )
+                    diag = cur.fetchone()
+                    if diag:
+                        total_l, cnt_a, cnt_url = int(diag[0] or 0), int(diag[1] or 0), int(diag[2] or 0)
+                        if cnt_a == 0:
+                            logging.info(
+                                "헤이딜러 상세: 최신 적재일(%s) 기준 신규(register_flag=A) 0건 → "
+                                "상세 크롤 생략 후 DAG 정상 완료로 진행. "
+                                "(최신일 전체 행=%s, detail_url 보유 행=%s)",
+                                latest_pnttm,
+                                total_l,
+                                cnt_url,
+                            )
+                        else:
+                            logging.warning(
+                                "상세 대상 0건: 최신일(%s)에 신규(A)=%s건 있으나 "
+                                "detail_url이 있는 신규만 수집하므로 매칭 0건 (detail_url 있음=%s).",
+                                latest_pnttm,
+                                cnt_a,
+                                cnt_url,
+                            )
         finally:
             try:
                 conn.close()
@@ -128,7 +167,12 @@ def heydealer_detail_crawl():
 
         logging.info("수집 대상: %d건", len(rows))
         if not rows:
-            raise ValueError("수집 대상 URL이 없습니다. 테이블을 확인하세요.")
+            logging.info("수집할 데이터가 없습니다.")
+        if not rows and latest_pnttm is None:
+            logging.warning(
+                "수집 대상 없음: %s 에 date_crtr_pnttm 최신값이 없습니다.",
+                SOURCE_LIST_TABLE,
+            )
         return rows
 
     @task
@@ -138,7 +182,7 @@ def heydealer_detail_crawl():
         with_url = sum(1 for r in target_rows if str(r.get("detail_url") or "").strip())
         logging.info("상세 크롤 준비: 총 %d건, detail_url 있음 %d건", n, with_url)
         if not target_rows:
-            raise ValueError("summarize_targets: 대상이 비어 있습니다.")
+            logging.info("상세 수집 대상 0건 — 다음 태스크에서 헤더만 CSV 생성 후 정상 완료합니다.")
         return target_rows
 
     # ── Task 2 : 상세 크롤링 + CSV 저장 ───────────────────────────────────
@@ -147,28 +191,36 @@ def heydealer_detail_crawl():
         # Airflow DAG 파싱 단계에서 playwright 미설치/무거운 import로 DAGFileProcessor가 죽는 문제 방지
         from playwright.sync_api import sync_playwright
 
-        """
-        playwright로 detail_url 순회 크롤링 후
-        heydealer_detail_YYYYMMDDHHMI.csv 저장.
-        반환값: 생성된 CSV 절대경로 문자열
-        """
-        # 출력 경로 결정
+        # playwright로 detail_url 순회 → heydealer_detail_YYYYMMDDHHMI.csv, 행마다 List complete_yn 갱신
         output_dir = _get_output_dir()
         output_dir.mkdir(parents=True, exist_ok=True)
-        run_ts   = datetime.now().strftime("%Y%m%d%H%M")
+        run_ts = datetime.now().strftime("%Y%m%d%H%M")
         csv_path = output_dir / f"heydealer_detail_{run_ts}.csv"
         logging.info("출력 파일: %s", csv_path)
 
-        detail_img_dir = _get_detail_img_dir()
-        detail_img_dir.mkdir(parents=True, exist_ok=True)
-        CommonUtil.clear_image_files(detail_img_dir, recursive=False)
-        logging.info("상세 이미지 저장 디렉터리: %s", detail_img_dir.resolve())
+        detail_base = _get_detail_img_dir()
+        detail_base.mkdir(parents=True, exist_ok=True)
+        logging.info(
+            "상세 이미지 루트(삭제 없음): …/detail/{product_id}/{product_id}_N.png → %s",
+            detail_base.resolve(),
+        )
 
         total = len(target_rows)
         collected = 0
         failed = 0
         skipped = 0
         recycle_every = 300
+        pg_hook = PostgresHook(postgres_conn_id="car_db_conn")
+
+        if total == 0:
+            with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.DictWriter(f, fieldnames=DETAIL_CSV_FIELDS)
+                w.writeheader()
+            logging.info(
+                "수집할 데이터가 없습니다. Playwright 생략, 헤더만 기록: %s",
+                csv_path,
+            )
+            return str(csv_path)
 
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -198,30 +250,106 @@ def heydealer_detail_crawl():
                 product_id = str(row.get("product_id") or "").strip()
                 detail_url = str(row.get("detail_url") or "").strip()
 
-                if not detail_url:
+                if not product_id:
                     skipped += 1
+                    logging.warning(
+                        "[상세수집실패] [%d/%d] product_id=(비어 있음) detail_url=%s "
+                        "reason=product_id 없음 → complete_yn 갱신 불가, 스킵",
+                        idx,
+                        total,
+                        (detail_url[:160] + "…") if len(detail_url) > 160 else detail_url or "(없음)",
+                    )
                     continue
 
-                # 진행 로그: 1건 / 100건마다 / 마지막
+                if not detail_url:
+                    skipped += 1
+                    try:
+                        CommonUtil.update_list_complete_yn_for_product_id(
+                            pg_hook,
+                            list_table=SOURCE_LIST_TABLE,
+                            product_id=product_id,
+                            value="N",
+                            list_where_policy=CommonUtil.DETAIL_LIST_COMPLETE_FLAG_POLICY_LATEST_SNAPSHOT,
+                            register_flag_a_only=True,
+                        )
+                    except Exception:
+                        logging.exception(
+                            "[%d/%d] complete_yn=N DB 갱신 실패 (detail_url 없음) product_id=%s",
+                            idx,
+                            total,
+                            product_id,
+                        )
+                    logging.warning(
+                        "[상세수집실패] [%d/%d] product_id=%s detail_url=(없음) reason=detail_url 비어 있음 → complete_yn=N",
+                        idx,
+                        total,
+                        product_id or "(빈값)",
+                    )
+                    continue
+
                 if idx == 1 or idx % 50 == 0 or idx == total:
                     logging.info(
                         "[%d/%d] 호출 대상 - product_id=%s, detail_url=%s",
-                        idx, total, product_id, detail_url,
+                        idx,
+                        total,
+                        product_id,
+                        detail_url,
                     )
 
+                per_detail_dir = detail_base / product_id
+                per_detail_dir.mkdir(parents=True, exist_ok=True)
+
+                success = False
+                fail_reason: str | None = None
                 try:
-                    detail_data = _crawl_one(page, idx, product_id, detail_url, detail_img_dir)
+                    detail_data = _crawl_one(page, idx, product_id, detail_url, per_detail_dir)
                     if detail_data:
                         _save_to_csv_append(csv_path, DETAIL_CSV_FIELDS, detail_data)
+                        success = True
                         collected += 1
                     else:
+                        fail_reason = (
+                            "상세 수집 결과 없음(접속 실패·파싱 오류·필수 필드 미충족)"
+                        )
                         failed += 1
                 except Exception as e:
+                    fail_reason = f"{type(e).__name__}: {e}"
                     failed += 1
                     logging.exception(
-                        "[%d/%d] 상세 수집 예외 - product_id=%s, detail_url=%s, err=%s",
-                        idx, total, product_id, detail_url, e,
+                        "[상세수집실패] [%d/%d] product_id=%s detail_url=%s 예외 발생",
+                        idx,
+                        total,
+                        product_id or "(빈값)",
+                        detail_url,
                     )
+                finally:
+                    try:
+                        yn = "Y" if success else "N"
+                        CommonUtil.update_list_complete_yn_for_product_id(
+                            pg_hook,
+                            list_table=SOURCE_LIST_TABLE,
+                            product_id=product_id,
+                            value=yn,
+                            list_where_policy=CommonUtil.DETAIL_LIST_COMPLETE_FLAG_POLICY_LATEST_SNAPSHOT,
+                            register_flag_a_only=True,
+                        )
+                    except Exception:
+                        logging.exception(
+                            "[%d/%d] complete_yn=%s DB 갱신 실패 product_id=%s",
+                            idx,
+                            total,
+                            yn,
+                            product_id,
+                        )
+                    if not success and fail_reason:
+                        logging.error(
+                            "[상세수집실패] [%d/%d] product_id=%s detail_url=%s reason=%s → complete_yn=N",
+                            idx,
+                            total,
+                            product_id or "(빈값)",
+                            detail_url,
+                            fail_reason,
+                        )
 
                 if idx % 100 == 0 or idx == total:
                     logging.info(
@@ -274,20 +402,47 @@ def heydealer_detail_crawl():
         crawl_and_save_csv 결과 CSV를 ods.ods_car_detail_heydealer로 적재.
         - 테이블 컬럼 기준으로 CSV 컬럼을 자동 필터링
         - truncate 없이 append insert
-        - 적재 후 list 테이블에서 해당 product_id의 register_flag를 A→Y로 갱신
+        - 원천 Car List vs Detail 로 complete_yn Y/N (크롤 중 단건 갱신 후 최종 동기화, register_flag 미변경)
         """
         p = Path(str(csv_path or ""))
         if not p.is_file():
             raise FileNotFoundError(f"적재 대상 CSV가 없습니다: {p}")
 
         rows = _read_csv_rows(p)
-        if not rows:
-            raise ValueError(f"적재할 CSV 데이터가 없습니다: {p}")
-
         hook = PostgresHook(postgres_conn_id="car_db_conn")
-        _bulk_insert_rows(hook, TARGET_DETAIL_TABLE, rows, truncate=False, allow_only_table_cols=True)
-        _mark_heydealer_list_rows_processed(hook, SOURCE_LIST_TABLE, rows)
-        _log_register_flag_distribution(hook, SOURCE_LIST_TABLE, "detail_ODS적재_list갱신_후")
+        if not rows:
+            logging.info(
+                "헤이딜러 상세 DAG 정상 완료: 신규(register_flag=A) 차량 없음 → detail INSERT 생략, "
+                "원천 List complete_yn(Y/N)만 최신 스냅샷 기준으로 동기화합니다. csv=%s",
+                p,
+            )
+            CommonUtil.refresh_car_list_complete_flag_vs_detail_ods(
+                hook,
+                list_table=SOURCE_LIST_TABLE,
+                detail_table=TARGET_DETAIL_TABLE,
+                list_where_policy=CommonUtil.DETAIL_LIST_COMPLETE_FLAG_POLICY_LATEST_SNAPSHOT,
+            )
+            _log_register_flag_distribution(hook, SOURCE_LIST_TABLE, "detail_ODS적재_complete_yn_동기화_후_신규0건")
+            table_count = CommonUtil.get_table_row_count(hook, TARGET_DETAIL_TABLE)
+            return {
+                "done": True,
+                "status": "completed_no_new_cars",
+                "message": "신규 중고차 없음, 상세 수집 생략, complete_yn 동기화만 수행",
+                "target_table": TARGET_DETAIL_TABLE,
+                "row_count": 0,
+                "table_count": table_count,
+                "csv_path": str(p),
+                "skipped_insert": True,
+            }
+
+        CommonUtil.bulk_insert_detail_ods_rows(hook, TARGET_DETAIL_TABLE, rows, truncate=False, allow_only_table_cols=True)
+        CommonUtil.refresh_car_list_complete_flag_vs_detail_ods(
+            hook,
+            list_table=SOURCE_LIST_TABLE,
+            detail_table=TARGET_DETAIL_TABLE,
+            list_where_policy=CommonUtil.DETAIL_LIST_COMPLETE_FLAG_POLICY_LATEST_SNAPSHOT,
+        )
+        _log_register_flag_distribution(hook, SOURCE_LIST_TABLE, "detail_ODS적재_complete_yn_동기화_후")
         table_count = CommonUtil.get_table_row_count(hook, TARGET_DETAIL_TABLE)
         logging.info(
             "헤이딜러 detail CSV 적재 완료: table=%s, inserted_rows=%d, table_count=%d, csv=%s",
@@ -302,6 +457,7 @@ def heydealer_detail_crawl():
             "row_count": len(rows),
             "table_count": table_count,
             "csv_path": str(p),
+            "skipped_insert": False,
         }
 
     @task_group(group_id="prepare_detail_crawl")
@@ -358,8 +514,7 @@ def _get_output_dir() -> Path:
 def _get_detail_img_dir() -> Path:
     """
     Airflow Variable used_car_image_file_path 기준
-    {img_root}/YYYY년/헤이딜러/detail
-    예) /home/limhayoung/data/img/2026년/헤이딜러/detail
+    {img_root}/YYYY년/헤이딜러/detail — 차량별 {product_id}_1.png … (폴더 비우지 않음).
     """
     try:
         img_root = Path(str(Variable.get(IMAGE_FILE_PATH_VAR)).strip())
@@ -412,117 +567,6 @@ def _read_csv_rows(csv_path: Path) -> list[dict[str, Any]]:
         return []
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
         return [dict(r) for r in csv.DictReader(f)]
-
-
-def _split_schema_table(full_name: str) -> tuple[str, str]:
-    if "." in full_name:
-        schema, table = full_name.split(".", 1)
-        return schema.strip(), table.strip()
-    return "public", full_name.strip()
-
-
-def _get_table_columns(hook: PostgresHook, full_table_name: str) -> list[str]:
-    schema, table = _split_schema_table(full_table_name)
-    sql = """
-    SELECT column_name
-    FROM information_schema.columns
-    WHERE table_schema = %s
-      AND table_name = %s
-    ORDER BY ordinal_position
-    """
-    rows = hook.get_records(sql, parameters=(schema, table))
-    return [r[0] for r in rows]
-
-
-def _bulk_insert_rows(
-    hook: PostgresHook,
-    full_table_name: str,
-    rows: list[dict[str, Any]],
-    *,
-    truncate: bool = False,
-    allow_only_table_cols: bool = True,
-) -> None:
-    if not rows:
-        return
-
-    table_cols = _get_table_columns(hook, full_table_name) if allow_only_table_cols else []
-    table_col_set = set(table_cols)
-
-    candidate_cols: list[str] = []
-    for row in rows:
-        for key in row.keys():
-            if key not in candidate_cols:
-                candidate_cols.append(key)
-
-    insert_cols = [c for c in candidate_cols if c in table_col_set] if table_cols else candidate_cols
-    if not insert_cols:
-        raise ValueError(f"insert 가능한 컬럼이 없습니다. table={full_table_name}")
-
-    values = [tuple(row.get(col) for col in insert_cols) for row in rows]
-
-    conn = hook.get_conn()
-    try:
-        with conn.cursor() as cur:
-            if truncate:
-                cur.execute(f"TRUNCATE TABLE {full_table_name}")
-
-            from psycopg2.extras import execute_values
-
-            cols_sql = ", ".join([f'"{col}"' for col in insert_cols])
-            sql = f"INSERT INTO {full_table_name} ({cols_sql}) VALUES %s"
-            execute_values(cur, sql, values, page_size=2000)
-        conn.commit()
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
-def _mark_heydealer_list_rows_processed(
-    hook: PostgresHook,
-    source_list_table: str,
-    detail_rows: list[dict[str, Any]],
-    *,
-    key_col: str = "product_id",
-    flag_col: str = "register_flag",
-) -> int:
-    """
-    detail 적재 성공 후, 해당 list row의 register_flag를 'Y'로 표시.
-    register_flag가 'A'이면서 data_crtr_pnttm이 테이블 전체 최신값인 행만 갱신한다.
-    (상세 수집 대상 조회와 동일한 스냅샷 기준)
-    """
-    product_ids = sorted({str(r.get(key_col) or "").strip() for r in detail_rows if str(r.get(key_col) or "").strip()})
-    if not product_ids:
-        return 0
-
-    conn = hook.get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                UPDATE {source_list_table} u
-                SET "{flag_col}" = 'Y'
-                WHERE u."{key_col}" = ANY(%s)
-                  AND TRIM(COALESCE(u."{flag_col}", '')) = 'A'
-                  AND u."data_crtr_pnttm" IS NOT NULL
-                  AND u."data_crtr_pnttm" = (
-                      SELECT MAX(m."data_crtr_pnttm")
-                      FROM {source_list_table} m
-                      WHERE m."data_crtr_pnttm" IS NOT NULL
-                  )
-                """,
-                (product_ids,),
-            )
-            updated = int(cur.rowcount or 0)
-        conn.commit()
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-    logging.info("헤이딜러 list register_flag 처리완료 업데이트: updated=%d", updated)
-    return updated
 
 
 def _log_register_flag_distribution(hook: PostgresHook, table: str, context: str) -> dict[str, int]:
@@ -1031,10 +1075,10 @@ def _crawl_one(
         except Exception as e:
             logging.debug("[섹션5] %s : %s", product_id, e)
 
-        # ── 상세 갤러리 이미지 (car_imgs 컬럼은 저장 디렉터리 절대경로, 파일은 detail/{product_id}_N.png)
+        # ── 상세 갤러리 이미지 (car_imgs=차량별 폴더 절대경로, {product_id}_1.png부터)
         try:
             gallery_urls = _collect_heydealer_detail_gallery_urls(page)
-            for gi, gurl in enumerate(gallery_urls, 1):
+            for gi, gurl in enumerate(gallery_urls, start=1):
                 out = detail_img_dir / f"{product_id}_{gi}.png"
                 _download_detail_gallery_image(page, gurl, out)
         except Exception as e:

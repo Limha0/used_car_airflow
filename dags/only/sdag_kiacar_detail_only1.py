@@ -25,7 +25,7 @@ from util.playwright_util import GotoSpec, goto_with_retry, install_route_blocki
 
 
 @dag(
-    dag_id="sdag_kiacar_crawler",
+    dag_id="sdag_kiacar_detail_only1",
     schedule="@daily",
     start_date=pendulum.datetime(2026, 3, 1, tz="Asia/Seoul"),
     catchup=False,
@@ -192,6 +192,18 @@ def kiacar_crawler_dag():
             sync_result["marked_missing_count"],
             sync_result["source_count"],
         )
+        try:
+            CommonUtil.refresh_car_list_complete_flag_vs_detail_table(
+                hook,
+                list_table=source_table,
+                detail_table=KIACAR_DETAIL_TARGET_TABLE,
+                list_where_policy=CommonUtil.DETAIL_COMPLETE_FLAG_WHERE_LATEST_SNAPSHOT_ONLY,
+            )
+        except Exception as e:
+            logging.warning(
+                "기아 list complete_flag 동기화 실패(detail ODS 미적재·테이블 없음 등): %s",
+                e,
+            )
         return {
             "done": True,
             "tmp_table": tmp_table,
@@ -274,6 +286,7 @@ KIACAR_SITE_NAME = "기아차"
 KIACAR_BRAND_TABLE = "ods.ods_brand_list_kiacar"
 KIACAR_TMP_LIST_TABLE = "ods.ods_tmp_car_list_kiacar"
 KIACAR_SOURCE_LIST_TABLE = "ods.ods_car_list_kiacar"
+KIACAR_DETAIL_TARGET_TABLE = "ods.ods_car_detail_kiacar"
 KIACAR_COLLECT_DETAIL_TABLE = "std.tn_data_clct_dtl_info"
 
 URL = "https://cpo.kia.com/products/"
@@ -472,12 +485,6 @@ try:
     activate_paths_for_datst(KIACAR_DATST_LIST)
 except Exception:
     pass
-
-
-def _kiacar_list_image_relpath(product_id: str) -> str:
-    """Variable 이미지 루트 기준 목록 썸네일 상대경로: {연도}년/사이트/list/{product_id}/{product_id}_list.png."""
-    site = get_site_name_by_datst(KIACAR_DATST_LIST)
-    return f"{YEAR_STR}/{site}/list/{product_id}/{product_id}_list.png"
 
 
 def _split_schema_table(full_name: str) -> tuple[str, str]:
@@ -1236,12 +1243,9 @@ def _extract_row_from_kiacar_card(li) -> dict[str, str]:
     return row
 
 
-def _download_kiacar_card_first_img(page, li, save_dir: Path, product_id: str, logger) -> str:
-    if not product_id:
-        return ""
-    product_dir = save_dir / product_id
-    product_dir.mkdir(parents=True, exist_ok=True)
-    out_path = product_dir / f"{product_id}_list.png"
+def _download_kiacar_card_first_img(page, li, save_dir: Path, file_stem: str, logger) -> str:
+    save_dir.mkdir(parents=True, exist_ok=True)
+    out_path = save_dir / f"{file_stem}.png"
     selectors = [
         # 요청하신 케이스(카드 내 첫 img):
         # 1) .img-wrap__discount ... a[rel] ... img.item-card__img...
@@ -1301,7 +1305,7 @@ def _download_kiacar_card_first_img(page, li, save_dir: Path, product_id: str, l
         if not resp or not resp.ok:
             return ""
         out_path.write_bytes(resp.body())
-        return _kiacar_list_image_relpath(product_id)
+        return str(out_path.resolve())
     except Exception as e:
         logger.debug("기아 리스트 이미지 다운로드 실패: %s (%s)", img_url, e)
         return ""
@@ -1477,7 +1481,7 @@ def run_kiacar_list(
                     li.scroll_into_view_if_needed(timeout=3000)
                 except Exception:
                     pass
-                car_imgs = _download_kiacar_card_first_img(page, li, list_save_dir, pid, logger) or ""
+                car_imgs = _download_kiacar_card_first_img(page, li, list_save_dir, f"{pid}_list", logger) or ""
                 w.writerow(
                     {
                         "model_sn": model_sn,

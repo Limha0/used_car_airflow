@@ -2,6 +2,9 @@
 """
 현대 인증중고차 목록 페이지에서 브랜드/차종/목록 수집.
 
+목록 썸네일: {img_root}/{연도}년/현대차/list/{product_id}/{product_id}_list.png (Variable used_car_image_file_path).
+상세 갤러리는 sdag_hyundaicar_detail_crawl. register_flag A→Y 등은 본 DAG tmp→원천 동기화에서만 처리.
+
 Airflow DAG:
 - DB 메타(std.tn_data_bsc_info, ps00003, data7/8/9) 조회
 - 차종 CSV -> 브랜드 CSV -> 목록 CSV 생성
@@ -1364,6 +1367,12 @@ def _extract_list_rows_from_dom(page, date_crtr_pnttm: str, create_dt: str) -> l
                     .map(node => norm(node.textContent || ''))
                     .filter(Boolean);
                 const thumb = li.querySelector('.unit_img img, [class*="unit_img"] img');
+                let thumbSrc = '';
+                if (thumb) {
+                    thumbSrc = norm(
+                        (thumb.currentSrc || thumb.getAttribute('src') || thumb.getAttribute('data-src') || '') + ''
+                    );
+                }
                 return {
                     product_id: productIdFromHref(href),
                     car_type: '',
@@ -1383,7 +1392,7 @@ def _extract_list_rows_from_dom(page, date_crtr_pnttm: str, create_dt: str) -> l
                     car_imgs: '',
                     date_crtr_pnttm: meta.date_crtr_pnttm,
                     create_dt: meta.create_dt,
-                    thumb_src: norm(thumb ? (thumb.getAttribute('src') || thumb.getAttribute('data-src') || '') : ''),
+                    thumb_src: thumbSrc,
                 };
             });
         }
@@ -1399,25 +1408,45 @@ def _save_list_thumbnail_from_src(
     logger,
     *,
     return_absolute: bool = False,
+    api_request=None,
 ) -> str:
     if not src or not product_id:
         return ""
+    s = (src or "").strip()
+    if s.startswith("//"):
+        abs_url = "https:" + s
+    elif s.startswith(("http://", "https://")):
+        abs_url = s
+    else:
+        abs_url = urljoin(URL, s)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": URL,
+    }
+    product_dir = img_dir / product_id
     try:
-        img_dir.mkdir(parents=True, exist_ok=True)
-        abs_url = urljoin(URL, src)
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": URL,
-        }
-        response = requests.get(abs_url, headers=headers, timeout=15)
-        response.raise_for_status()
-        out_path = img_dir / f"{product_id}_list.png"
-        out_path.write_bytes(response.content)
+        product_dir.mkdir(parents=True, exist_ok=True)
+        out_path = product_dir / f"{product_id}_list.png"
+        if api_request is not None:
+            resp = api_request.get(abs_url, timeout=30_000, headers=headers)
+            if resp.status != 200:
+                logger.warning(
+                    "목록 썸네일 HTTP %s product_id=%s url=%s",
+                    resp.status,
+                    product_id,
+                    abs_url[:160],
+                )
+                return ""
+            out_path.write_bytes(resp.body())
+        else:
+            response = requests.get(abs_url, headers=headers, timeout=20)
+            response.raise_for_status()
+            out_path.write_bytes(response.content)
         if return_absolute:
-            return str(out_path)
-        return f"imgs/{YEAR_STR}/{HYUNDAICAR_SITE_NAME}/list/{product_id}_list.png"
+            return str(out_path.resolve())
+        return f"{YEAR_STR}/{HYUNDAICAR_SITE_NAME}/list/{product_id}/{product_id}_list.png"
     except Exception as e:
-        logger.debug("목록 썸네일 저장 실패 %s: %s", product_id, e)
+        logger.warning("목록 썸네일 저장 실패 product_id=%s: %s", product_id, e)
         return ""
 
 
@@ -1538,6 +1567,7 @@ def run_hyundaicar_list(
                         img_save_dir,
                         logger,
                         return_absolute=list_img_dir is not None,
+                        api_request=page.context.request,
                     )
 
                     w.writerow({key: row.get(key, "") for key in headers})

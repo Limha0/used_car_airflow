@@ -65,13 +65,13 @@ DETAIL_CSV_FIELDS = [
     tags=["used_car", "autoinside", "detail", "crawler"],
 )
 def autoinside_detail_crawl():
-    """오토인사이드 상세페이지 크롤링 DAG (register_flag = 'A' 신규, 최신 data_crtr_pnttm 배치만)."""
+    """오토인사이드 상세: register_flag='A' 만 수집 → CSV 한 줄마다 List complete_yn Y/N, 이후 Detail 적재·동기화. Reg_Flag 는 List DAG 전용."""
 
     @task
     def fetch_target_urls() -> list[dict[str, str]]:
         """
         ods.ods_car_list_autoinside 에서
-        register_flag = 'A' 이고 data_crtr_pnttm 이 테이블 내 최신 적재일자와 같은 행만 조회한다.
+        register_flag = 'A' 이고 date_crtr_pnttm 이 테이블 내 최신 적재일자와 같은 행만 조회한다.
         """
         sql = f"""
         SELECT
@@ -82,11 +82,11 @@ def autoinside_detail_crawl():
         WHERE TRIM(COALESCE(l.register_flag, '')) = 'A'
           AND l.detail_url IS NOT NULL
           AND TRIM(l.detail_url) != ''
-          AND l."data_crtr_pnttm" IS NOT NULL
-          AND l."data_crtr_pnttm" = (
-              SELECT MAX(m."data_crtr_pnttm")
+          AND l."date_crtr_pnttm" IS NOT NULL
+          AND l."date_crtr_pnttm" = (
+              SELECT MAX(m."date_crtr_pnttm")
               FROM {SOURCE_LIST_TABLE} m
-              WHERE m."data_crtr_pnttm" IS NOT NULL
+              WHERE m."date_crtr_pnttm" IS NOT NULL
           )
         ORDER BY l.model_sn
         """
@@ -98,21 +98,58 @@ def autoinside_detail_crawl():
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    SELECT MAX(m."data_crtr_pnttm")
+                    SELECT MAX(m."date_crtr_pnttm")
                     FROM {SOURCE_LIST_TABLE} m
-                    WHERE m."data_crtr_pnttm" IS NOT NULL
+                    WHERE m."date_crtr_pnttm" IS NOT NULL
                     """
                 )
                 max_row = cur.fetchone()
                 latest_pnttm = max_row[0] if max_row else None
                 logging.info(
-                    "오토인사이드 detail 수집 기준 data_crtr_pnttm(최신): %s",
+                    "오토인사이드 detail 수집 기준 date_crtr_pnttm(최신): %s",
                     latest_pnttm,
                 )
                 cur.execute(sql)
                 cols = [d[0] for d in cur.description]
                 for row in cur.fetchall():
                     rows.append(dict(zip(cols, row)))
+
+                if not rows and latest_pnttm is not None:
+                    cur.execute(
+                        f"""
+                        SELECT
+                            COUNT(*) AS total_latest,
+                            COUNT(*) FILTER (
+                                WHERE TRIM(COALESCE(register_flag, '')) = 'A'
+                            ) AS cnt_a,
+                            COUNT(*) FILTER (
+                                WHERE detail_url IS NOT NULL AND TRIM(detail_url) <> ''
+                            ) AS cnt_url
+                        FROM {SOURCE_LIST_TABLE}
+                        WHERE "date_crtr_pnttm" = %s
+                        """,
+                        (latest_pnttm,),
+                    )
+                    diag = cur.fetchone()
+                    if diag:
+                        total_l, cnt_a, cnt_url = int(diag[0] or 0), int(diag[1] or 0), int(diag[2] or 0)
+                        if cnt_a == 0:
+                            logging.info(
+                                "오토인사이드 상세: 최신 적재일(%s) 기준 신규(register_flag=A) 0건 → "
+                                "이번에 새로 추가된 중고차 없음. 상세 크롤 생략 후 DAG 정상 완료로 진행합니다. "
+                                "(최신일 전체 행=%s, detail_url 보유 행=%s)",
+                                latest_pnttm,
+                                total_l,
+                                cnt_url,
+                            )
+                        else:
+                            logging.warning(
+                                "상세 대상 0건: 최신일(%s)에 신규(A)=%s건 있으나 "
+                                "detail_url이 있는 신규만 수집하므로 매칭 0건 (detail_url 있음=%s).",
+                                latest_pnttm,
+                                cnt_a,
+                                cnt_url,
+                            )
         finally:
             try:
                 conn.close()
@@ -121,7 +158,12 @@ def autoinside_detail_crawl():
 
         logging.info("수집 대상: %d건", len(rows))
         if not rows:
-            raise ValueError("수집 대상 URL이 없습니다. 테이블을 확인하세요.")
+            logging.info("수집할 데이터가 없습니다.")
+        if not rows and latest_pnttm is None:
+            logging.warning(
+                "수집 대상 없음: %s 에 date_crtr_pnttm 최신값이 없습니다.",
+                SOURCE_LIST_TABLE,
+            )
         return rows
 
     @task
@@ -130,7 +172,7 @@ def autoinside_detail_crawl():
         with_url = sum(1 for r in target_rows if str(r.get("detail_url") or "").strip())
         logging.info("상세 크롤 준비: 총 %d건, detail_url 있음 %d건", n, with_url)
         if not target_rows:
-            raise ValueError("summarize_targets: 대상이 비어 있습니다.")
+            logging.info("상세 수집 대상 0건 — 다음 태스크에서 헤더만 CSV 생성 후 정상 완료합니다.")
         return target_rows
 
     @task
@@ -144,16 +186,29 @@ def autoinside_detail_crawl():
         csv_path = output_dir / f"autoinside_detail_{run_ts}.csv"
         logging.info("출력 파일: %s", csv_path)
 
-        detail_img_dir = _get_detail_img_dir()
-        detail_img_dir.mkdir(parents=True, exist_ok=True)
-        CommonUtil.clear_image_files(detail_img_dir, recursive=False)
-        logging.info("상세 이미지 저장 디렉터리: %s", detail_img_dir.resolve())
+        detail_base = _get_detail_img_dir()
+        detail_base.mkdir(parents=True, exist_ok=True)
+        logging.info(
+            "상세 이미지 루트(삭제 없음): …/detail/{product_id}/{product_id}_N.png → %s",
+            detail_base.resolve(),
+        )
 
         total = len(target_rows)
+        if total == 0:
+            with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.DictWriter(f, fieldnames=DETAIL_CSV_FIELDS)
+                w.writeheader()
+            logging.info(
+                "수집할 데이터가 없습니다. Playwright 생략, 헤더만 기록: %s",
+                csv_path,
+            )
+            return str(csv_path)
+
         collected = 0
         failed = 0
         skipped = 0
         recycle_every = 300
+        pg_hook = PostgresHook(postgres_conn_id="car_db_conn")
 
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -183,8 +238,41 @@ def autoinside_detail_crawl():
                 product_id = str(row.get("product_id") or "").strip()
                 detail_url = str(row.get("detail_url") or "").strip()
 
+                if not product_id:
+                    skipped += 1
+                    logging.warning(
+                        "[상세수집실패] [%d/%d] product_id=(비어 있음) detail_url=%s "
+                        "reason=product_id 없음 → complete_yn 갱신 불가, 스킵",
+                        idx,
+                        total,
+                        (detail_url[:160] + "…") if len(detail_url) > 160 else detail_url or "(없음)",
+                    )
+                    continue
+
                 if not detail_url:
                     skipped += 1
+                    try:
+                        CommonUtil.update_list_complete_yn_for_product_id(
+                            pg_hook,
+                            list_table=SOURCE_LIST_TABLE,
+                            product_id=product_id,
+                            value="N",
+                            list_where_policy=CommonUtil.DETAIL_LIST_COMPLETE_FLAG_POLICY_LATEST_SNAPSHOT,
+                            register_flag_a_only=True,
+                        )
+                    except Exception:
+                        logging.exception(
+                            "[%d/%d] complete_yn=N DB 갱신 실패 (detail_url 없음) product_id=%s",
+                            idx,
+                            total,
+                            product_id,
+                        )
+                    logging.warning(
+                        "[상세수집실패] [%d/%d] product_id=%s detail_url=(없음) reason=detail_url 비어 있음 → complete_yn=N",
+                        idx,
+                        total,
+                        product_id or "(빈값)",
+                    )
                     continue
 
                 if idx == 1 or idx % 50 == 0 or idx == total:
@@ -196,23 +284,60 @@ def autoinside_detail_crawl():
                         detail_url,
                     )
 
+                per_detail_dir = detail_base / product_id
+                per_detail_dir.mkdir(parents=True, exist_ok=True)
+
+                success = False
+                fail_reason: str | None = None
                 try:
-                    detail_data = _crawl_one(page, idx, product_id, detail_url, detail_img_dir)
+                    detail_data = _crawl_one(page, idx, product_id, detail_url, per_detail_dir)
                     if detail_data:
                         _save_to_csv_append(csv_path, DETAIL_CSV_FIELDS, detail_data)
+                        success = True
                         collected += 1
                     else:
+                        fail_reason = (
+                            "상세 수집 결과 없음(접속 실패·파싱 오류·필수 필드 car_name/year/km 미충족)"
+                        )
                         failed += 1
                 except Exception as e:
+                    fail_reason = f"{type(e).__name__}: {e}"
                     failed += 1
                     logging.exception(
-                        "[%d/%d] 상세 수집 예외 - product_id=%s, detail_url=%s, err=%s",
+                        "[상세수집실패] [%d/%d] product_id=%s detail_url=%s 예외 발생",
                         idx,
                         total,
-                        product_id,
+                        product_id or "(빈값)",
                         detail_url,
-                        e,
                     )
+                finally:
+                    try:
+                        yn = "Y" if success else "N"
+                        CommonUtil.update_list_complete_yn_for_product_id(
+                            pg_hook,
+                            list_table=SOURCE_LIST_TABLE,
+                            product_id=product_id,
+                            value=yn,
+                            list_where_policy=CommonUtil.DETAIL_LIST_COMPLETE_FLAG_POLICY_LATEST_SNAPSHOT,
+                            register_flag_a_only=True,
+                        )
+                    except Exception:
+                        logging.exception(
+                            "[%d/%d] complete_yn=%s DB 갱신 실패 product_id=%s",
+                            idx,
+                            total,
+                            yn,
+                            product_id,
+                        )
+                    if not success and fail_reason:
+                        logging.error(
+                            "[상세수집실패] [%d/%d] product_id=%s detail_url=%s reason=%s → complete_yn=N",
+                            idx,
+                            total,
+                            product_id or "(빈값)",
+                            detail_url,
+                            fail_reason,
+                        )
 
                 if idx % 100 == 0 or idx == total:
                     logging.info(
@@ -268,20 +393,46 @@ def autoinside_detail_crawl():
     def load_detail_csv_to_ods(csv_path: str) -> dict[str, Any]:
         """
         crawl_and_save_csv 결과 CSV를 ods.ods_car_detail_autoinside로 적재.
-        - 테이블 컬럼 기준으로 CSV 컬럼을 자동 필터링
-        - truncate 없이 append insert
+        - 컬럼 필터링·append insert
+        - 원천 Car List vs Detail 로 complete_yn Y/N (크롤 중 단건 갱신 후 최종 동기화, register_flag 미변경)
         """
         p = Path(str(csv_path or ""))
         if not p.is_file():
             raise FileNotFoundError(f"적재 대상 CSV가 없습니다: {p}")
 
         rows = _read_csv_rows(p)
-        if not rows:
-            raise ValueError(f"적재할 CSV 데이터가 없습니다: {p}")
-
         hook = PostgresHook(postgres_conn_id="car_db_conn")
-        _bulk_insert_rows(hook, TARGET_DETAIL_TABLE, rows, truncate=False, allow_only_table_cols=True)
-        _mark_autoinside_list_rows_processed(hook, SOURCE_LIST_TABLE, rows)
+        if not rows:
+            logging.info(
+                "오토인사이드 상세 DAG 정상 완료: 신규(register_flag=A) 차량 없음 → detail INSERT 생략, "
+                "원천 List complete_yn(Y/N)만 최신 스냅샷 기준으로 동기화합니다. csv=%s",
+                p,
+            )
+            CommonUtil.refresh_car_list_complete_flag_vs_detail_ods(
+                hook,
+                list_table=SOURCE_LIST_TABLE,
+                detail_table=TARGET_DETAIL_TABLE,
+                list_where_policy=CommonUtil.DETAIL_LIST_COMPLETE_FLAG_POLICY_LATEST_SNAPSHOT,
+            )
+            table_count = CommonUtil.get_table_row_count(hook, TARGET_DETAIL_TABLE)
+            return {
+                "done": True,
+                "status": "completed_no_new_cars",
+                "message": "신규 중고차 없음, 상세 수집 생략, complete_yn 동기화만 수행",
+                "target_table": TARGET_DETAIL_TABLE,
+                "row_count": 0,
+                "table_count": table_count,
+                "csv_path": str(p),
+                "skipped_insert": True,
+            }
+
+        CommonUtil.bulk_insert_detail_ods_rows(hook, TARGET_DETAIL_TABLE, rows, truncate=False, allow_only_table_cols=True)
+        CommonUtil.refresh_car_list_complete_flag_vs_detail_ods(
+            hook,
+            list_table=SOURCE_LIST_TABLE,
+            detail_table=TARGET_DETAIL_TABLE,
+            list_where_policy=CommonUtil.DETAIL_LIST_COMPLETE_FLAG_POLICY_LATEST_SNAPSHOT,
+        )
         table_count = CommonUtil.get_table_row_count(hook, TARGET_DETAIL_TABLE)
         logging.info(
             "오토인사이드 detail CSV 적재 완료: table=%s, inserted_rows=%d, table_count=%d, csv=%s",
@@ -296,6 +447,7 @@ def autoinside_detail_crawl():
             "row_count": len(rows),
             "table_count": table_count,
             "csv_path": str(p),
+            "skipped_insert": False,
         }
 
     @task_group(group_id="prepare_detail_crawl")
@@ -348,8 +500,7 @@ def _get_output_dir() -> Path:
 def _get_detail_img_dir() -> Path:
     """
     Airflow Variable used_car_image_file_path 기준
-    {img_root}/YYYY년/오토인사이드/detail
-    예) /home/limhayoung/data/img/2026년/오토인사이드/detail
+    {img_root}/YYYY년/오토인사이드/detail — 차량별 {product_id}_1.png … 저장(DAG에서 폴더 비우지 않음).
     """
     try:
         img_root = Path(str(Variable.get(IMAGE_FILE_PATH_VAR)).strip())
@@ -403,116 +554,6 @@ def _read_csv_rows(csv_path: Path) -> list[dict[str, Any]]:
         return []
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
         return [dict(r) for r in csv.DictReader(f)]
-
-
-def _split_schema_table(full_name: str) -> tuple[str, str]:
-    if "." in full_name:
-        schema, table = full_name.split(".", 1)
-        return schema.strip(), table.strip()
-    return "public", full_name.strip()
-
-
-def _get_table_columns(hook: PostgresHook, full_table_name: str) -> list[str]:
-    schema, table = _split_schema_table(full_table_name)
-    sql = """
-    SELECT column_name
-    FROM information_schema.columns
-    WHERE table_schema = %s
-      AND table_name = %s
-    ORDER BY ordinal_position
-    """
-    rows = hook.get_records(sql, parameters=(schema, table))
-    return [r[0] for r in rows]
-
-
-def _bulk_insert_rows(
-    hook: PostgresHook,
-    full_table_name: str,
-    rows: list[dict[str, Any]],
-    *,
-    truncate: bool = False,
-    allow_only_table_cols: bool = True,
-) -> None:
-    if not rows:
-        return
-
-    table_cols = _get_table_columns(hook, full_table_name) if allow_only_table_cols else []
-    table_col_set = set(table_cols)
-
-    candidate_cols: list[str] = []
-    for row in rows:
-        for key in row.keys():
-            if key not in candidate_cols:
-                candidate_cols.append(key)
-
-    insert_cols = [c for c in candidate_cols if c in table_col_set] if table_cols else candidate_cols
-    if not insert_cols:
-        raise ValueError(f"insert 가능한 컬럼이 없습니다. table={full_table_name}")
-
-    values = [tuple(row.get(col) for col in insert_cols) for row in rows]
-
-    conn = hook.get_conn()
-    try:
-        with conn.cursor() as cur:
-            if truncate:
-                cur.execute(f"TRUNCATE TABLE {full_table_name}")
-
-            from psycopg2.extras import execute_values
-
-            cols_sql = ", ".join([f'"{col}"' for col in insert_cols])
-            sql = f"INSERT INTO {full_table_name} ({cols_sql}) VALUES %s"
-            execute_values(cur, sql, values, page_size=2000)
-        conn.commit()
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
-def _mark_autoinside_list_rows_processed(
-    hook: PostgresHook,
-    source_list_table: str,
-    detail_rows: list[dict[str, Any]],
-    *,
-    key_col: str = "product_id",
-    flag_col: str = "register_flag",
-) -> int:
-    """
-    detail 적재 성공 후, 해당 list row의 register_flag를 'Y'로 표시한다.
-    register_flag가 'A'이면서 data_crtr_pnttm이 테이블 전체 최신값인 행만 갱신한다.
-    """
-    product_ids = sorted({str(r.get(key_col) or "").strip() for r in detail_rows if str(r.get(key_col) or "").strip()})
-    if not product_ids:
-        return 0
-
-    conn = hook.get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                UPDATE {source_list_table} u
-                SET "{flag_col}" = 'Y'
-                WHERE u."{key_col}" = ANY(%s)
-                  AND TRIM(COALESCE(u."{flag_col}", '')) = 'A'
-                  AND u."data_crtr_pnttm" IS NOT NULL
-                  AND u."data_crtr_pnttm" = (
-                      SELECT MAX(m."data_crtr_pnttm")
-                      FROM {source_list_table} m
-                      WHERE m."data_crtr_pnttm" IS NOT NULL
-                  )
-                """,
-                (product_ids,),
-            )
-            updated = int(cur.rowcount or 0)
-        conn.commit()
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-    logging.info("오토인사이드 list register_flag 처리완료 업데이트: updated=%d", updated)
-    return updated
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -570,6 +611,152 @@ def _download_image(page, image_url: str, save_path: Path) -> bool:
         return True
     except Exception:
         return False
+
+
+def _autoinside_norm_img_url(raw: str, page_url: str) -> str:
+    s = (raw or "").strip()
+    if not s or s.startswith("data:"):
+        return ""
+    if s.startswith("//"):
+        s = "https:" + s
+    elif s.startswith("/"):
+        s = urljoin(page_url, s)
+    elif not s.startswith("http"):
+        s = urljoin(page_url, s)
+    return s
+
+
+def _autoinside_collect_urls_from_imgs(imgs_locator, page_url: str, seen: set[str], out: list[str]) -> None:
+    """swiper-slide img에서 data-src / currentSrc / src 순으로 URL 수집."""
+    for i in range(imgs_locator.count()):
+        img = imgs_locator.nth(i)
+        try:
+            src = img.evaluate(
+                """el => {
+                    const ds = el.getAttribute('data-src') || el.getAttribute('data-original');
+                    if (ds && ds.trim() && !ds.trim().startsWith('data:')) return ds.trim();
+                    if (el.currentSrc && el.currentSrc.trim() && !el.currentSrc.startsWith('data:')) return el.currentSrc.trim();
+                    const s = el.getAttribute('src');
+                    if (s && s.trim() && !s.trim().startsWith('data:')) return s.trim();
+                    return '';
+                }"""
+            )
+        except Exception:
+            src = ""
+        u = _autoinside_norm_img_url(str(src or ""), page_url)
+        # onerror에서 치환되는 placeholder(svg)는 저장할 가치가 낮아 제외
+        if u and "img_car_view_no_img.svg" in u:
+            continue
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+
+
+def _collect_autoinside_detail_gallery_urls(page, root) -> list[str]:
+    """
+    오토인사이드 상세 갤러리 URL 수집.
+    - 기존 `.img_section.on`만 보면 활성 탭·현재 슬라이드 1장만 잡히는 경우가 많음.
+    - 모든 img_section 탭을 순회하고, swiper next로 lazy 슬라이드까지 펼친 뒤 수집한다.
+    """
+    page_url = page.url or "https://www.autoinside.co.kr/"
+    seen: set[str] = set()
+    urls: list[str] = []
+
+    # 1) 우선: thumbs swiper(`thumb_slide`) 안에 있는 모든 img를 수집
+    #    사용자가 준 DOM 예시 구조:
+    #    `.swiper-wrapper` 밑에 `.swiper-slide` 밑 `img`
+    try:
+        thumb_imgs_sel = ".thumb_slide .swiper-wrapper .swiper-slide img"
+        thumb_imgs = root.locator(thumb_imgs_sel)
+        if thumb_imgs.count() == 0:
+            # fallback: thumb_slide 클래스가 안 잡히거나 DOM이 변형되는 경우
+            fallback_sel = ".swiper-wrapper .swiper-slide img"
+            thumb_imgs = root.locator(fallback_sel)
+            if thumb_imgs.count() == 0:
+                thumb_imgs = page.locator(fallback_sel)
+        _autoinside_collect_urls_from_imgs(thumb_imgs, page_url, seen, urls)
+    except Exception:
+        pass
+
+    slide_img_sel = ".main_slide .swiper-slide:not(.swiper-slide-duplicate) img"
+    broad_fallback_sel = (
+        ".car_view_content .car_img_wrap .main_slide img, "
+        ".car_view_content .section.car_img_wrap .main_slide img"
+    )
+
+    def collect_from_section(sec) -> None:
+        imgs = sec.locator(slide_img_sel)
+        if imgs.count() == 0:
+            imgs = sec.locator(".main_slide img")
+        _autoinside_collect_urls_from_imgs(imgs, page_url, seen, urls)
+
+    def swiper_advance_slide_scope(slide_scope, gallery_wrap) -> None:
+        """다음 버튼은 종종 slide_scope 밖(.car_img_wrap 공통)에 있다."""
+        next_btn = slide_scope.locator(".swiper-button-next").first
+        if next_btn.count() == 0 and gallery_wrap.count() > 0:
+            next_btn = gallery_wrap.locator(".swiper-button-next").first
+        no_new_streak = 0
+        for _ in range(120):
+            before = len(urls)
+            try:
+                if next_btn.count() > 0:
+                    next_btn.click(timeout=2500)
+                    page.wait_for_timeout(220)
+            except Exception:
+                break
+            imgs2 = slide_scope.locator(slide_img_sel)
+            if imgs2.count() == 0:
+                imgs2 = slide_scope.locator(".main_slide img")
+            if imgs2.count() == 0 and gallery_wrap.count() > 0:
+                imgs2 = gallery_wrap.locator(slide_img_sel)
+                if imgs2.count() == 0:
+                    imgs2 = gallery_wrap.locator(".main_slide img")
+            _autoinside_collect_urls_from_imgs(imgs2, page_url, seen, urls)
+            if len(urls) == before:
+                no_new_streak += 1
+                if no_new_streak >= 10:
+                    break
+            else:
+                no_new_streak = 0
+
+    try:
+        gallery_wrap = root.locator(".car_view_content .section.car_img_wrap").first
+        if gallery_wrap.count() == 0:
+            gallery_wrap = root.locator(".car_view_content .car_img_wrap").first
+
+        sections = root.locator(".car_view_content .section.car_img_wrap .img_section")
+        n_sec = sections.count()
+        if n_sec > 0:
+            for si in range(n_sec):
+                sec = sections.nth(si)
+                try:
+                    sec.scroll_into_view_if_needed(timeout=5000)
+                except Exception:
+                    pass
+                try:
+                    sec.click(timeout=3000)
+                except Exception:
+                    try:
+                        sec.click(timeout=3000, force=True)
+                    except Exception:
+                        pass
+                page.wait_for_timeout(350)
+                collect_from_section(sec)
+                swiper_advance_slide_scope(sec, gallery_wrap)
+        elif gallery_wrap.count() > 0:
+            collect_from_section(gallery_wrap)
+            swiper_advance_slide_scope(gallery_wrap, gallery_wrap)
+
+        if not urls:
+            imgs = root.locator(broad_fallback_sel)
+            _autoinside_collect_urls_from_imgs(imgs, page_url, seen, urls)
+            wrap2 = root.locator(".section.car_img_wrap, .car_img_wrap").first
+            if wrap2.count() > 0:
+                swiper_advance_slide_scope(wrap2, wrap2)
+    except Exception as e:
+        logging.debug("[갤러리 URL] 수집 예외: %s", e)
+
+    return urls
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -725,33 +912,16 @@ def _crawl_one(
         except Exception:
             data["car_inspect"] = ""
 
-        # ── 상세 이미지 저장 ─────────────────────────────────────────────
+        # ── 상세 이미지 저장 (탭·swiper 전체 순회) ────────────────────────
         try:
-            img_root = root.locator(
-                ".car_view_content .section.car_img_wrap .img_section.on "
-                ".main_slide .swiper-wrapper .swiper-slide.cmn_slide img"
+            gallery_urls = _collect_autoinside_detail_gallery_urls(page, root)
+            logging.debug(
+                "[갤러리 이미지] %s 수집 URL %d건",
+                product_id,
+                len(gallery_urls),
             )
-            if img_root.count() == 0:
-                img_root = root.locator(
-                    ".car_view_content .section.car_img_wrap .main_slide img"
-                )
-            seen: set[str] = set()
-            page_url = page.url or "https://www.autoinside.co.kr/"
-            for i in range(img_root.count()):
-                img = img_root.nth(i)
-                src = (img.get_attribute("data-src") or img.get_attribute("src") or "").strip()
-                if not src:
-                    continue
-                if src.startswith("//"):
-                    src = "https:" + src
-                elif src.startswith("/"):
-                    src = urljoin(page_url, src)
-                elif not src.startswith("http"):
-                    src = urljoin(page_url, src)
-                if src in seen:
-                    continue
-                seen.add(src)
-                out = detail_img_dir / f"{product_id}_{len(seen)}.png"
+            for j, src in enumerate(gallery_urls, start=1):
+                out = detail_img_dir / f"{product_id}_{j}.png"
                 _download_image(page, src, out)
         except Exception as e:
             logging.debug("[갤러리 이미지] %s : %s", product_id, e)

@@ -2,11 +2,14 @@
 """
 K Car 검색 페이지에서 차종/브랜드/목록 수집.
 
+목록 썸네일(Variable used_car_image_file_path): {연도}년/케이카/list/{product_id}/{product_id}_list.png.
+
 Airflow DAG:
 - DB 메타(std.tn_data_bsc_info, ps00004, data10/11/12) 조회
 - 차종 CSV -> 브랜드 CSV -> 목록 CSV 생성
 - 수집 메타(std.tn_data_clct_dtl_info) 등록 후 ODS 적재
 - list는 임시 테이블 적재 후 원천 테이블과 동기화
+- 정상 완료 후 sdag_kcar_detail_crawl 트리거
 """
 import csv
 import logging
@@ -22,6 +25,7 @@ import pendulum
 import requests
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from playwright.sync_api import sync_playwright
 
@@ -259,7 +263,7 @@ def kcar_crawler_dag():
     def insert_csv_process(
         bsc_infos: dict[str, dict[str, Any]],
         tn_data_clct_dtl_info_map: dict[str, dict[str, Any]],
-    ) -> None:
+    ):
         brand_load_result = load_csv_to_ods.override(task_id="load_brand_csv_to_ods")(
             bsc_infos,
             tn_data_clct_dtl_info_map,
@@ -275,16 +279,30 @@ def kcar_crawler_dag():
             tn_data_clct_dtl_info_map,
             KCAR_DATST_LIST,
         )
-        sync_list_tmp_to_source.override(task_id="sync_list_tmp_to_source")(
+        sync_result = sync_list_tmp_to_source.override(task_id="sync_list_tmp_to_source")(
             bsc_infos,
             brand_load_result,
             car_type_load_result,
             list_load_result,
         )
+        return sync_result
 
     infos = insert_collect_data_info()
     tn_data_clct_dtl_info_map = create_csv_process(infos)
-    insert_csv_process(infos, tn_data_clct_dtl_info_map)
+    sync_result = insert_csv_process(infos, tn_data_clct_dtl_info_map)
+
+    trigger_detail_dag = TriggerDagRunOperator(
+        task_id="trigger_kcar_detail_dag",
+        trigger_dag_id="sdag_kcar_detail_crawl",
+        wait_for_completion=False,
+        reset_dag_run=True,
+        conf={
+            "source_dag_id": "sdag_kcar_crawler",
+            "source_run_id": "{{ run_id }}",
+            "source_logical_date": "{{ ds }}",
+        },
+    )
+    sync_result >> trigger_detail_dag
 
 
 USED_CAR_SITE_NAMES_VAR = "used_car_site_names"
@@ -1842,9 +1860,15 @@ def run_kcar_list(
                             detail_url = DETAIL_URL_TEMPLATE.format(product_id_out) if product_id_out != "-" else "-"
                             car_imgs_val = "-"
                             if product_id_out != "-" and img_src:
-                                list_img_path = list_save_dir / f"{product_id_out}_list.png"
+                                list_img_path = (
+                                    list_save_dir / product_id_out / f"{product_id_out}_list.png"
+                                )
                                 if _download_list_image(page, img_src, list_img_path, logger):
-                                    car_imgs_val = str(list_img_path)
+                                    site_nm = get_kcar_site_name()
+                                    car_imgs_val = (
+                                        f"{YEAR_STR}/{site_nm}/list/{product_id_out}/"
+                                        f"{product_id_out}_list.png"
+                                    )
 
                             if product_id_out != "-" or car_name:
                                 model_sn += 1
