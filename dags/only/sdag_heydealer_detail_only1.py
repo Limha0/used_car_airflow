@@ -64,7 +64,7 @@ DETAIL_CSV_FIELDS = [
     schedule=None,
     start_date=pendulum.datetime(2026, 3, 1, tz="Asia/Seoul"),
     catchup=False,
-    tags=["used_car", "heydealer", "detail", "crawler"],
+    tags=["used_car", "heydealer",  "crawler"],
 )
 def heydealer_detail_crawl():
     """헤이딜러 상세페이지 크롤링 DAG (register_flag != 'N' 전체). Task group으로 준비 → 크롤·저장 단계 분리."""

@@ -61,7 +61,7 @@ DETAIL_CSV_FIELDS = [
     schedule=None,
     start_date=pendulum.datetime(2026, 3, 1, tz="Asia/Seoul"),
     catchup=False,
-    tags=["used_car", "autoinside", "detail", "only1"],
+    tags=["used_car", "autoinside", "only1"],
 )
 def autoinside_detail_crawl():
     """오토인사이드 상세페이지 크롤링 DAG (register_flag != 'N' 전체)."""

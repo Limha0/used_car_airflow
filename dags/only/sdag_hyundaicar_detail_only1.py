@@ -77,7 +77,7 @@ DETAIL_CSV_FIELDS = [
     schedule=None,
     start_date=pendulum.datetime(2026, 3, 1, tz="Asia/Seoul"),
     catchup=False,
-    tags=["used_car", "hyundaicar", "detail", "only1"],
+    tags=["used_car", "hyundaicar", "only1"],
 )
 def hyundaicar_detail_crawl():
     """현대차 인증중고차 상세페이지 크롤링 DAG (register_flag != 'N' 전체)."""

@@ -30,7 +30,7 @@ from util.playwright_util import GotoSpec, goto_with_retry, install_route_blocki
     start_date=pendulum.datetime(2026, 3, 1, tz="Asia/Seoul"),
     catchup=False,
     render_template_as_native_obj=True,
-    tags=["used_car", "kiacar", "crawler", "day"],
+    tags=["used_car", "kiacar", "only1"],
 )
 def kiacar_crawler_dag():
     
