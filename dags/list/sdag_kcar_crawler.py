@@ -2,7 +2,7 @@
 """
 K Car 검색 페이지에서 차종/브랜드/목록 수집.
 
-목록 썸네일(Variable used_car_image_file_path): {연도}년/케이카/list/{product_id}/{product_id}_list.png.
+목록 썸네일(Variable used_car_image_file_path): {루트}/{연도}년/케이카/list/{product_id}/{product_id}_list.png 저장,
 
 Airflow DAG:
 - DB 메타(std.tn_data_bsc_info, ps00004, data10/11/12) 조회
@@ -1864,11 +1864,7 @@ def run_kcar_list(
                                     list_save_dir / product_id_out / f"{product_id_out}_list.png"
                                 )
                                 if _download_list_image(page, img_src, list_img_path, logger):
-                                    site_nm = get_kcar_site_name()
-                                    car_imgs_val = (
-                                        f"{YEAR_STR}/{site_nm}/list/{product_id_out}/"
-                                        f"{product_id_out}_list.png"
-                                    )
+                                    car_imgs_val = str(list_img_path.resolve())
 
                             if product_id_out != "-" or car_name:
                                 model_sn += 1

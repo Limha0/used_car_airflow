@@ -600,10 +600,11 @@ def _get_output_dir() -> Path:
 
 def _get_detail_img_dir() -> Path:
     """
-    K Car 상세 갤러리 상위 디렉터리(차량별은 이 경로 아래 detail/{product_id}/).
+    K Car 상세 갤러리 상위 디렉터리. 차량별 폴더는 (이 경로)/{product_id}/.
+
     - Variable 미설정: ~/used_car_crawler/imgs/kcar/detail
-    - Variable 값이 .../kcar/detail 로 끝나면 그 경로 그대로 사용(차량별 하위폴더 동일)
-    - 그 외: 변수 루트 아래 {연도}년/케이카/detail
+    - 값이 …/kcar/detail 로 끝나면 그 경로 그대로 사용
+    - 그 외: {변수 루트}/{연도}년/케이카/detail
     """
     default_detail = Path.home() / "used_car_crawler" / "imgs" / "kcar" / "detail"
     try:
@@ -1123,15 +1124,6 @@ def _download_detail_image(page, img_src: str, save_path: Path, *, referer: str)
     return False
 
 
-def _kcar_image_file_stem(product_id: str) -> str:
-    """파일명: EC61321311 → 61321311_1.png 용 stem (선행 비숫자 제거)."""
-    s = (product_id or "").strip()
-    if not s:
-        return "unknown"
-    tail = re.sub(r"^[^0-9]+", "", s)
-    return tail if tail else s
-
-
 def _norm_img_src(raw: str, page_url: str) -> str:
     src = (raw or "").strip()
     if not src or src.startswith("data:"):
@@ -1147,7 +1139,8 @@ def _norm_img_src(raw: str, page_url: str) -> str:
 
 def _collect_kcar_pdp_thumbnail_urls(page) -> list[str]:
     """
-    PDP 썸네일: DOM에 이미 박혀 있는 속성만 읽음(data-src·src·srcset, picture/source).
+    PDP 썸네일: body → #__nuxt → … → .el-carousel-thumbnail-item[data-thumbnail-item-index]
+    트리 안의 img/picture 속성만 읽음(data-src·src·srcset, picture/source).
     lazy-load 스크롤/대기·currentSrc·computed background-image 는 쓰지 않음.
     """
     page_url = page.url or "https://www.kcar.com/"
@@ -1163,32 +1156,32 @@ def _collect_kcar_pdp_thumbnail_urls(page) -> list[str]:
                 return out;
             };
             const qFullType1 =
-              '#__nuxt #__layout .Container .carInfoWrap.carInfoType1 .carInfoContainer ' +
+              'body #__nuxt #__layout .Container .carInfoWrap.carInfoType1 .carInfoContainer ' +
               '.carInfoContent .carInfoKeyArea .carInfoGallery .pdp-cover-slider-container ' +
               '.el-carousel-thumbnail .el-carousel-thumbnail-scroll.el-scrollbar ' +
               '.el-scrollbar__wrap .el-scrollbar__view .el-carousel-thumbnail-wrap ' +
               '.el-carousel-thumbnail-item[data-thumbnail-item-index]';
             const qFullWrap =
-              '#__nuxt #__layout .Container .carInfoWrap .carInfoContainer ' +
+              'body #__nuxt #__layout .Container .carInfoWrap .carInfoContainer ' +
               '.carInfoContent .carInfoKeyArea .carInfoGallery .pdp-cover-slider-container ' +
               '.el-carousel-thumbnail .el-carousel-thumbnail-scroll.el-scrollbar ' +
               '.el-scrollbar__wrap .el-scrollbar__view .el-carousel-thumbnail-wrap ' +
               '.el-carousel-thumbnail-item[data-thumbnail-item-index]';
             const qScrollLoose =
-              '#__nuxt #__layout .Container .carInfoWrap .carInfoContainer ' +
+              'body #__nuxt #__layout .Container .carInfoWrap .carInfoContainer ' +
               '.carInfoContent .carInfoKeyArea .carInfoGallery .pdp-cover-slider-container ' +
               '.el-carousel-thumbnail .el-carousel-thumbnail-scroll ' +
               '.el-scrollbar__wrap .el-scrollbar__view .el-carousel-thumbnail-wrap ' +
               '.el-carousel-thumbnail-item[data-thumbnail-item-index]';
             const qGallery =
-              '.carInfoGallery .pdp-cover-slider-container .el-carousel-thumbnail ' +
+              'body .carInfoGallery .pdp-cover-slider-container .el-carousel-thumbnail ' +
               '.el-carousel-thumbnail-scroll.el-scrollbar .el-scrollbar__wrap .el-scrollbar__view ' +
               '.el-carousel-thumbnail-wrap .el-carousel-thumbnail-item[data-thumbnail-item-index]';
             const qGalleryShort =
-              '.carInfoGallery .pdp-cover-slider-container .el-carousel-thumbnail ' +
+              'body .carInfoGallery .pdp-cover-slider-container .el-carousel-thumbnail ' +
               '.el-scrollbar__wrap .el-scrollbar__view .el-carousel-thumbnail-wrap ' +
               '.el-carousel-thumbnail-item[data-thumbnail-item-index]';
-            const qLoose = '.carInfoGallery .el-carousel-thumbnail-item[data-thumbnail-item-index]';
+            const qLoose = 'body .carInfoGallery .el-carousel-thumbnail-item[data-thumbnail-item-index]';
             let nodes = uniqNodes([
                 ...document.querySelectorAll(qFullType1),
                 ...document.querySelectorAll(qFullWrap),
@@ -1326,17 +1319,17 @@ def _collect_kcar_slide_index_button_bg_urls(page) -> list[str]:
 
 def _collect_kcar_gallery_image_urls(page) -> list[str]:
     """
-    갤러리 이미지 수집(다운로드는 _crawl_one에서 {숫자stem}_1.png … 로 저장).
+    갤러리 이미지 수집(다운로드는 _crawl_one에서 {product_id}_1.png … 로 저장).
     lazy-load 유도 없이 DOM 속성·인라인 style 만 읽음.
-    1) button[data-slide-index] + background-image:url(...) (현행 PDP)
-    2) el-carousel 썸네일(data-thumbnail-item-index)
+    1) el-carousel 썸네일(data-thumbnail-item-index) — PDP 기본 트리 우선
+    2) button[data-slide-index] + background-image:url(...)
     3) 구형 kaps-slider / kaps-item img
     """
-    urls = _collect_kcar_slide_index_button_bg_urls(page)
+    urls = _collect_kcar_pdp_thumbnail_urls(page)
     if urls:
         return urls
 
-    urls = _collect_kcar_pdp_thumbnail_urls(page)
+    urls = _collect_kcar_slide_index_button_bg_urls(page)
     if urls:
         return urls
 
@@ -1631,18 +1624,10 @@ def _crawl_one(page, idx: int, product_id: str, detail_url: str, detail_img_dir:
                         os.environ.get("USED_CAR_SKIP_IMAGES", "0"),
                     )
             if urls:
-                img_stem = _kcar_image_file_stem(product_id)
-                # logging.info(
-                #     "kcar detail 이미지 다운로드 시작: product_id=%s, stem=%s, url_count=%d → %s",
-                #     product_id,
-                #     img_stem,
-                #     len(urls),
-                #     detail_img_dir,
-                # )
                 referer = (page.url or "").split("#")[0] or "https://www.kcar.com/"
                 ok = 0
                 for img_idx, img_url in enumerate(urls, 1):
-                    out = detail_img_dir / f"{img_stem}_{img_idx}.png"
+                    out = detail_img_dir / f"{product_id}_{img_idx}.png"
                     if _download_detail_image(page, img_url, out, referer=referer):
                         ok += 1
                 if ok == 0 and images_enabled():

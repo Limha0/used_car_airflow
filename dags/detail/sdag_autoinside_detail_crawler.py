@@ -31,6 +31,24 @@ FINAL_FILE_PATH_VAR = "used_car_final_file_path"  # Airflow Variable 키
 IMAGE_FILE_PATH_VAR = "used_car_image_file_path"  # 예: /home/limhayoung/data/img
 SITE_NAME = "오토인사이드"
 
+# 상세 메인 갤러리 DOM(요청 구조):
+# .carView.on #wrap #frm .container .container_inn .page.car_view_wrap .car_view_content
+# .section.car_img_wrap .img_section(.on) .main_slide(.swiper…) .swiper-wrapper .swiper-slide img
+_AUTOINSIDE_DETAIL_ROOT_SEL = (
+    ".carView.on #wrap #frm .container .container_inn .page.car_view_wrap"
+)
+_AUTOINSIDE_DETAIL_ROOT_SEL_CARVIEW = (
+    ".carView #wrap #frm .container .container_inn .page.car_view_wrap"
+)
+_AUTOINSIDE_DETAIL_ROOT_FALLBACK = "#wrap #frm .container .container_inn .page.car_view_wrap"
+# swiper-initialized 등 동적 클래스 없이 .main_slide 고정
+_AUTOINSIDE_MAIN_GALLERY_IMG_SEL = (
+    ".main_slide .swiper-wrapper .swiper-slide:not(.swiper-slide-duplicate) img"
+)
+_AUTOINSIDE_MAIN_GALLERY_IMG_SEL_LOOSE = (
+    ".main_slide .swiper-slide:not(.swiper-slide-duplicate) img"
+)
+
 DETAIL_CSV_FIELDS = [
     "model_sn",
     "product_id",
@@ -339,7 +357,7 @@ def autoinside_detail_crawl():
                             fail_reason,
                         )
 
-                if idx % 100 == 0 or idx == total:
+                if idx % 50 == 0 or idx == total:
                     logging.info(
                         "상세 수집 진행: processed=%d/%d, collected=%d, failed=%d, skipped=%d",
                         idx,
@@ -627,7 +645,7 @@ def _autoinside_norm_img_url(raw: str, page_url: str) -> str:
 
 
 def _autoinside_collect_urls_from_imgs(imgs_locator, page_url: str, seen: set[str], out: list[str]) -> None:
-    """swiper-slide img에서 data-src / currentSrc / src 순으로 URL 수집."""
+    """`.swiper-slide` 내부 `img`에서 data-src / currentSrc / src 순으로 URL 수집."""
     for i in range(imgs_locator.count()):
         img = imgs_locator.nth(i)
         try:
@@ -655,37 +673,30 @@ def _autoinside_collect_urls_from_imgs(imgs_locator, page_url: str, seen: set[st
 def _collect_autoinside_detail_gallery_urls(page, root) -> list[str]:
     """
     오토인사이드 상세 갤러리 URL 수집.
-    - 기존 `.img_section.on`만 보면 활성 탭·현재 슬라이드 1장만 잡히는 경우가 많음.
-    - 모든 img_section 탭을 순회하고, swiper next로 lazy 슬라이드까지 펼친 뒤 수집한다.
+    - 대상: `.car_view_content .section.car_img_wrap` 아래 각 `.img_section`의
+      `.main_slide .swiper-wrapper .swiper-slide` 안의 `img`(요청 DOM과 동일).
+    - 활성 탭만 보면 1장만 잡히는 경우가 있어, 모든 img_section을 클릭 순회하고
+      swiper next로 lazy 슬라이드까지 펼친 뒤 수집한다.
+    - 메인 슬라이드에서 URL이 전혀 없을 때만 썸네일 슬라이더(`thumb_slide`)를 보조로 사용한다.
     """
     page_url = page.url or "https://www.autoinside.co.kr/"
     seen: set[str] = set()
     urls: list[str] = []
 
-    # 1) 우선: thumbs swiper(`thumb_slide`) 안에 있는 모든 img를 수집
-    #    사용자가 준 DOM 예시 구조:
-    #    `.swiper-wrapper` 밑에 `.swiper-slide` 밑 `img`
-    try:
-        thumb_imgs_sel = ".thumb_slide .swiper-wrapper .swiper-slide img"
-        thumb_imgs = root.locator(thumb_imgs_sel)
-        if thumb_imgs.count() == 0:
-            # fallback: thumb_slide 클래스가 안 잡히거나 DOM이 변형되는 경우
-            fallback_sel = ".swiper-wrapper .swiper-slide img"
-            thumb_imgs = root.locator(fallback_sel)
-            if thumb_imgs.count() == 0:
-                thumb_imgs = page.locator(fallback_sel)
-        _autoinside_collect_urls_from_imgs(thumb_imgs, page_url, seen, urls)
-    except Exception:
-        pass
-
-    slide_img_sel = ".main_slide .swiper-slide:not(.swiper-slide-duplicate) img"
+    slide_img_sel = _AUTOINSIDE_MAIN_GALLERY_IMG_SEL
+    slide_img_loose = _AUTOINSIDE_MAIN_GALLERY_IMG_SEL_LOOSE
     broad_fallback_sel = (
+        ".car_view_content .section.car_img_wrap .img_section .main_slide "
+        ".swiper-wrapper .swiper-slide img, "
+        ".car_view_content .car_img_wrap .main_slide .swiper-wrapper .swiper-slide img, "
         ".car_view_content .car_img_wrap .main_slide img, "
         ".car_view_content .section.car_img_wrap .main_slide img"
     )
 
     def collect_from_section(sec) -> None:
         imgs = sec.locator(slide_img_sel)
+        if imgs.count() == 0:
+            imgs = sec.locator(slide_img_loose)
         if imgs.count() == 0:
             imgs = sec.locator(".main_slide img")
         _autoinside_collect_urls_from_imgs(imgs, page_url, seen, urls)
@@ -706,9 +717,13 @@ def _collect_autoinside_detail_gallery_urls(page, root) -> list[str]:
                 break
             imgs2 = slide_scope.locator(slide_img_sel)
             if imgs2.count() == 0:
+                imgs2 = slide_scope.locator(slide_img_loose)
+            if imgs2.count() == 0:
                 imgs2 = slide_scope.locator(".main_slide img")
             if imgs2.count() == 0 and gallery_wrap.count() > 0:
                 imgs2 = gallery_wrap.locator(slide_img_sel)
+                if imgs2.count() == 0:
+                    imgs2 = gallery_wrap.locator(slide_img_loose)
                 if imgs2.count() == 0:
                     imgs2 = gallery_wrap.locator(".main_slide img")
             _autoinside_collect_urls_from_imgs(imgs2, page_url, seen, urls)
@@ -753,6 +768,18 @@ def _collect_autoinside_detail_gallery_urls(page, root) -> list[str]:
             wrap2 = root.locator(".section.car_img_wrap, .car_img_wrap").first
             if wrap2.count() > 0:
                 swiper_advance_slide_scope(wrap2, wrap2)
+
+        if not urls:
+            try:
+                thumb_imgs_sel = ".thumb_slide .swiper-wrapper .swiper-slide img"
+                thumb_imgs = root.locator(thumb_imgs_sel)
+                if thumb_imgs.count() == 0:
+                    thumb_imgs = page.locator(".thumb_slide .swiper-wrapper .swiper-slide img")
+                if thumb_imgs.count() == 0:
+                    thumb_imgs = page.locator(".swiper-wrapper .swiper-slide img")
+                _autoinside_collect_urls_from_imgs(thumb_imgs, page_url, seen, urls)
+            except Exception:
+                pass
     except Exception as e:
         logging.debug("[갤러리 URL] 수집 예외: %s", e)
 
@@ -804,9 +831,12 @@ def _crawl_one(
                 logging.error("접속 실패: %s - %s", product_id, e)
                 return None
 
-    root = page.locator("#wrap #frm .container .container_inn .page.car_view_wrap").first
+    root = page.locator(_AUTOINSIDE_DETAIL_ROOT_SEL).first
     if root.count() == 0:
-        # fallback: 페이지 구조가 다를 때
+        root = page.locator(_AUTOINSIDE_DETAIL_ROOT_SEL_CARVIEW).first
+    if root.count() == 0:
+        root = page.locator(_AUTOINSIDE_DETAIL_ROOT_FALLBACK).first
+    if root.count() == 0:
         root = page.locator(".page.car_view_wrap").first
 
     try:

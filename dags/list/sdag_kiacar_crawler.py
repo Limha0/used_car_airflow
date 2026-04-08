@@ -279,7 +279,10 @@ KIACAR_COLLECT_DETAIL_TABLE = "std.tn_data_clct_dtl_info"
 URL = "https://cpo.kia.com/products/"
 DETAIL_URL_TEMPLATE = "https://cpo.kia.com/products/detail/?id={}"
 # goto 준비 확인용(Next.js 루트 → 필터/리스트는 SELECTOR_BASE 계열)
-# 주의: Emotion 해시(.css-xxxx)는 빌드마다 바뀌므로 쓰지 않는다.
+# 목록 카드 DOM(참고): #__next .wrap #content .carlist-main … .buy-carlist__content
+# .content-main .content-main__carcard .carcard-list > li.item-card.is-pc (및 Emotion 해시 클래스)
+# 이미지: li 내부 .css-kn97bq / .img-wrap__discount … → a[rel="noopener noreferrer"] → [class*="item-card__img"] img
+# Emotion 해시는 빌드마다 바뀔 수 있어 [class*="…"] / 부분 일치로 잡는다.
 SELECTOR_CONTAINER = "#__next"
 SELECTOR_BASE = (
     ".buy-carlist__left-side .filter-info.js-select-scrollbar "
@@ -475,7 +478,7 @@ except Exception:
 
 
 def _kiacar_list_image_relpath(product_id: str) -> str:
-    """Variable 이미지 루트 기준 목록 썸네일 상대경로: {연도}년/사이트/list/{product_id}/{product_id}_list.png."""
+    """참고용 상대경로 문자열. list CSV의 car_imgs는 `_download_kiacar_card_first_img`가 반환하는 저장 파일 절대경로를 쓴다."""
     site = get_site_name_by_datst(KIACAR_DATST_LIST)
     return f"{YEAR_STR}/{site}/list/{product_id}/{product_id}_list.png"
 
@@ -1237,24 +1240,40 @@ def _extract_row_from_kiacar_card(li) -> dict[str, str]:
 
 
 def _download_kiacar_card_first_img(page, li, save_dir: Path, product_id: str, logger) -> str:
+    """
+    카드(li)에서 목록 썸네일 첫 img URL을 구해
+    {save_dir}/{product_id}/{product_id}_list.png 로 저장하고, 저장 파일 절대경로를 반환한다.
+    (used_car_image_file_path → …/{연}년/기아차/list/… 구조는 activate_paths + save_dir=list 가 담당)
+    """
     if not product_id:
         return ""
     product_dir = save_dir / product_id
     product_dir.mkdir(parents=True, exist_ok=True)
     out_path = product_dir / f"{product_id}_list.png"
+    # DOM 순서: .css-kn97bq / .img-wrap__discount+css-kn97bq → a[rel="noopener noreferrer"] → [class*="item-card__img"] img
     selectors = [
-        # 요청하신 케이스(카드 내 첫 img):
-        # 1) .img-wrap__discount ... a[rel] ... img.item-card__img...
-        "div.img-wrap__discount a[rel='noopener noreferrer'] img[class*='item-card__img']",
-        # 2) .css-kn97bq ... a[rel] ... img.item-card__img...
-        "div.css-kn97bq a[rel='noopener noreferrer'] img[class*='item-card__img']",
-        # 3) a[rel] 하위 img.item-card__img...
-        "a[rel='noopener noreferrer'] img[class*='item-card__img']",
-        # 4) 카드 내부에서 item-card__img 계열 (reserved/css-s13p8 포함)
+        "div.css-kn97bq a[rel='noopener noreferrer'] [class*='item-card__img'] img",
+        "div[class*='css-kn97bq'] a[rel='noopener noreferrer'] [class*='item-card__img'] img",
+        "div.img-wrap__discount.css-kn97bq a[rel='noopener noreferrer'] [class*='item-card__img'] img",
+        "div.img-wrap__discount[class*='css-kn97bq'] a[rel='noopener noreferrer'] [class*='item-card__img'] img",
+        "div.img-wrap__discount a[rel='noopener noreferrer'] [class*='item-card__img'] img",
+        "a[rel='noopener noreferrer'] [class*='item-card__img'][class*='reserved'] img",
+        "a[rel='noopener noreferrer'] [class*='item-card__img'] img",
+        "a[rel='noopener noreferrer'].item-card__img img",
         "img[class*='item-card__img']",
-        # 최후 fallback: 카드 내부 첫 img
         "img",
     ]
+
+    def _pick_src_from_img_locator(img) -> str:
+        try:
+            return (
+                (img.get_attribute("src") or "").strip()
+                or (img.get_attribute("data-src") or "").strip()
+                or (img.get_attribute("srcset") or "").strip()
+                or (img.get_attribute("data-srcset") or "").strip()
+            )
+        except Exception:
+            return ""
 
     img_src = ""
     for sel in selectors:
@@ -1262,21 +1281,31 @@ def _download_kiacar_card_first_img(page, li, save_dir: Path, product_id: str, l
             img = li.locator(sel).first
             if img.count() == 0:
                 continue
-            img_src = (
-                (img.get_attribute("src") or "").strip()
-                or (img.get_attribute("data-src") or "").strip()
-                or (img.get_attribute("srcset") or "").strip()
-                or (img.get_attribute("data-srcset") or "").strip()
-            )
+            img_src = _pick_src_from_img_locator(img)
             if img_src:
                 break
         except Exception:
             continue
     if not img_src:
-        # evaluate fallback: currentSrc (lazy-load 대응)
         try:
             img_src = li.evaluate(
                 """el => {
+                  const sels = [
+                    "div.css-kn97bq a[rel='noopener noreferrer'] [class*='item-card__img'] img",
+                    "div[class*='css-kn97bq'] a[rel='noopener noreferrer'] [class*='item-card__img'] img",
+                    "div.img-wrap__discount.css-kn97bq a[rel='noopener noreferrer'] [class*='item-card__img'] img",
+                    "div.img-wrap__discount[class*='css-kn97bq'] a[rel='noopener noreferrer'] [class*='item-card__img'] img",
+                    "div.img-wrap__discount a[rel='noopener noreferrer'] [class*='item-card__img'] img",
+                    "a[rel='noopener noreferrer'] [class*='item-card__img'][class*='reserved'] img",
+                    "a[rel='noopener noreferrer'] [class*='item-card__img'] img",
+                    "img[class*='item-card__img']",
+                  ];
+                  for (const s of sels) {
+                    const img = el.querySelector(s);
+                    if (!img) continue;
+                    const u = (img.currentSrc || img.src || img.getAttribute('data-src') || '').trim();
+                    if (u && !u.startsWith('data:')) return u;
+                  }
                   const img = el.querySelector('img');
                   if (!img) return '';
                   return (img.currentSrc || img.src || img.getAttribute('data-src') || '').trim();
@@ -1287,7 +1316,6 @@ def _download_kiacar_card_first_img(page, li, save_dir: Path, product_id: str, l
     if not img_src:
         return ""
 
-    # srcset인 경우 첫 URL만 추출
     if "," in img_src or " " in img_src:
         try:
             first = img_src.split(",")[0].strip()
@@ -1296,12 +1324,17 @@ def _download_kiacar_card_first_img(page, li, save_dir: Path, product_id: str, l
             pass
 
     img_url = img_src if img_src.startswith("http") else urljoin(page.url or URL, img_src)
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": URL,
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
     try:
-        resp = page.request.get(img_url, timeout=20000)
+        resp = page.request.get(img_url, timeout=20_000, headers=headers)
         if not resp or not resp.ok:
             return ""
         out_path.write_bytes(resp.body())
-        return _kiacar_list_image_relpath(product_id)
+        return str(out_path.resolve())
     except Exception as e:
         logger.debug("기아 리스트 이미지 다운로드 실패: %s (%s)", img_url, e)
         return ""

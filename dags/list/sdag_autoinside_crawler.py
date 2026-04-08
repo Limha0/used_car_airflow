@@ -954,7 +954,7 @@ SELECTOR_CAR_ITEM = (
 def get_autoinside_imgs_relpath(dt=None):
     """
     used_car_image_file_path 기준 리스트 이미지 상대 경로(연도/사이트/list).
-    실제 파일은 list/{product_id}/{product_id}_list.png.
+    실제 파일은 list/{product_id}/{product_id}_list.<확장자>(응답 이미지 형식에 따름).
     """
     now = dt or datetime.now()
     return f"{now.strftime('%Y년')}/{AUTOINSIDE_SITE_NAME}/list"
@@ -1491,6 +1491,47 @@ def run_autoinside_brand_list(page, result_dir: Path, logger, csv_path: Path | N
 
 DETAIL_URL_TEMPLATE = "https://www.autoinside.co.kr/display/bu/display_bu_used_ah_car_view.do?i_sCarCd={product_id}"
 
+_AUTOINSIDE_LIST_IMG_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.autoinside.co.kr/",
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+}
+
+
+def _autoinside_list_image_ext(content: bytes, content_type: str | None) -> str | None:
+    """
+    다운로드 본문이 이미지인지 확인하고 저장용 확장자(jpg/png/webp/gif)를 반환.
+    HTML·JSON 등은 None (항상 .png로 저장하면 뷰어가 형식 오류로 거부하는 경우가 많음).
+    """
+    if not content or len(content) < 12:
+        return None
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct.startswith("text/html") or ct.startswith("application/json") or "html" in ct:
+        return None
+    head = content[:32].lstrip()
+    if head[:1] == b"<" or head[:4].lower() == b"<!do" or head[:7].lower() == b"<html":
+        return None
+    if content[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if len(content) >= 8 and content[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "webp"
+    if content[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if "jpeg" in ct or ct.endswith("/jpg") or "jpg" in ct:
+        return "jpg"
+    if "png" in ct:
+        return "png"
+    if "webp" in ct:
+        return "webp"
+    if "gif" in ct:
+        return "gif"
+    return None
+
 
 def download_autoinside_list_image(
     item_locator,
@@ -1502,7 +1543,8 @@ def download_autoinside_list_image(
 ) -> str | None:
     """
     목록 페이지의 한 car_item에서 .img_wrap .main_img 이미지를 다운로드하여
-    save_dir/{product_id}/{product_id}_list.png 로 저장. 저장된 파일의 상대 경로 문자열 반환, 실패 시 None.
+    save_dir/{product_id}/{product_id}_list.<ext> 로 저장(ext는 JPEG/PNG/WebP/GIF에 맞춤).
+    저장된 파일의 상대 경로 문자열 반환, 실패 시 None.
     """
     if not product_id or not save_dir:
         return None
@@ -1536,15 +1578,28 @@ def download_autoinside_list_image(
     elif src.startswith("/"):
         src = "https://www.autoinside.co.kr" + src
     try:
-        resp = requests.get(src, timeout=15)
+        resp = requests.get(src, timeout=15, headers=_AUTOINSIDE_LIST_IMG_HEADERS)
         resp.raise_for_status()
     except Exception as e:
         logger.warning("목록 이미지 다운로드 실패 %s: %s", product_id, e)
         return None
+    ext = _autoinside_list_image_ext(resp.content, resp.headers.get("Content-Type"))
+    if not ext:
+        logger.warning(
+            "목록 이미지가 이미지 바이너리가 아님(HTML·오류 페이지 등) product_id=%s url=%s…",
+            product_id,
+            src[:120],
+        )
+        return None
     product_dir = save_dir / product_id
-    save_path = product_dir / f"{product_id}_list.png"
+    save_path = product_dir / f"{product_id}_list.{ext}"
     try:
         product_dir.mkdir(parents=True, exist_ok=True)
+        for stale in product_dir.glob(f"{product_id}_list.*"):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
         with open(save_path, "wb") as f:
             f.write(resp.content)
     except Exception as e:
@@ -1553,7 +1608,7 @@ def download_autoinside_list_image(
     return (
         str(save_path)
         if return_absolute
-        else f"{get_autoinside_imgs_relpath()}/{product_id}/{product_id}_list.png"
+        else f"{get_autoinside_imgs_relpath()}/{product_id}/{product_id}_list.{ext}"
     )
 
 
@@ -1608,7 +1663,7 @@ def run_autoinside_list(
     - car_name: car_info 내 .nm 텍스트 (기존 nm)
     - car_spec, pyy, dvml, main, sub: 기존과 동일
     - detail_url: https://...display_bu_used_ah_car_view.do?i_sCarCd={product_id}
-    - car_imgs: 목록 .main_img 이미지 저장 경로 ({연도}년/사이트명/list/{product_id}/{product_id}_list.png)
+    - car_imgs: 목록 .main_img 이미지 저장 경로 ({연도}년/사이트명/list/{product_id}/{product_id}_list.<ext>)
     """
     result_dir.mkdir(parents=True, exist_ok=True)
     csv_path = list_csv_path if list_csv_path is not None else (result_dir / "autoinside_list.csv")
@@ -1718,7 +1773,7 @@ def run_autoinside_list(
                 car_list_val = (match["car_list"] or "") if match else ""
                 model_list_val = (match["model_list"] or "") if match else ""
 
-                # 목록 페이지 .main_img 이미지 다운로드 → list/{product_id}/{product_id}_list.png, car_imgs에 경로
+                # 목록 페이지 .main_img 이미지 다운로드 → list/{product_id}/{product_id}_list.<ext>, car_imgs에 경로
                 car_imgs_val = ""
                 if product_id:
                     car_imgs_val = download_autoinside_list_image(
@@ -1925,7 +1980,7 @@ def run_autoinside_list_by_car_type(
                     car_list_val = (match["car_list"] or "") if match else ""
                     model_list_val = (match["model_list"] or "") if match else ""
 
-                    # 목록 페이지 .main_img 이미지 다운로드 → list/{product_id}/{product_id}_list.png, car_imgs에 경로
+                    # 목록 페이지 .main_img 이미지 다운로드 → list/{product_id}/{product_id}_list.<ext>, car_imgs에 경로
                     car_imgs_val = ""
                     if product_id:
                         car_imgs_val = download_autoinside_list_image(

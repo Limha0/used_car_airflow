@@ -31,6 +31,15 @@ FINAL_FILE_PATH_VAR = "used_car_final_file_path"
 IMAGE_FILE_PATH_VAR = "used_car_image_file_path"  # 예: /home/limhayoung/data/img
 SITE_NAME = "기아차"
 
+# 상세 KV 갤러리: .buy-car-detail__kv-area … .tabs.tabs--car-img 의 3번째 탭 클릭 후
+# .thumb-flat.is-show … .swiper-slide[data-swiper-slide-index] 하위(또는 중첩 .swiper-slide) img
+KIACAR_DETAIL_GALLERY_TAB_ROOT = (
+    "#__next .wrap #content .buy-car-detail .buy-car-detail__kv-area "
+    ".buy-car-detail__tabs-slides .tabs-slides .tabs.tabs--car-img"
+)
+KIACAR_GALLERY_TAB_ITEMS = f"{KIACAR_DETAIL_GALLERY_TAB_ROOT} .tabs__item"
+KIACAR_GALLERY_THUMB_SHOW = ".thumb-flat.is-show"
+
 DETAIL_CSV_FIELDS = [
     "model_sn",
     "product_id",
@@ -646,7 +655,10 @@ def _download_image(page, image_url: str, save_path: Path) -> bool:
 
 def _collect_kia_tab_gallery_urls(page) -> list[str]:
     """
-    세 번째 탭(인덱스 2) 클릭 후 .thumb-flat.is-show 영역의 swiper-slide img URL 수집.
+    세 번째 `.tabs__item` 클릭 → 활성 탭에 `current` 부여 후,
+    `.thumb-flat.is-show` → `.thumb-flat__wrap` → `.thumb-slide` → `.swiper-wrapper` 안
+    `data-swiper-slide-index`가 있는 슬라이드(중첩 `.swiper-slide` 우선)의 `img` URL을
+    인덱스 순으로 수집한다.
     """
     seen: set[str] = set()
     urls: list[str] = []
@@ -668,33 +680,135 @@ def _collect_kia_tab_gallery_urls(page) -> list[str]:
             seen.add(src2)
             urls.append(src2)
 
-    try:
+    def _add_from_img_locator(node) -> None:
+        try:
+            src = node.evaluate(
+                """el => {
+                  const norm = s => (s || '').trim();
+                  let u = norm(el.currentSrc);
+                  if (u && !u.startsWith('data:')) return u;
+                  u = norm(el.getAttribute('data-src'));
+                  if (u && !u.startsWith('data:')) return u;
+                  u = norm(el.getAttribute('src'));
+                  if (u && !u.startsWith('data:')) return u;
+                  const ss = norm(el.getAttribute('srcset'));
+                  if (ss) {
+                    const first = ss.split(',')[0].trim().split(/\\s+/)[0];
+                    if (first) return first;
+                  }
+                  return '';
+                }"""
+            )
+        except Exception:
+            src = _safe_attr(node, "src") or _safe_attr(node, "data-src")
+        if src:
+            _add(str(src or ""))
+
+    tab_btns = page.locator(KIACAR_GALLERY_TAB_ITEMS)
+    if tab_btns.count() < 3:
         tab_btns = page.locator(".tabs.tabs--car-img .tabs__item")
+
+    try:
         if tab_btns.count() >= 3:
             tab_btns.nth(2).click(timeout=8000)
-            page.wait_for_timeout(600)
             try:
-                page.locator(".thumb-flat.is-show").first.wait_for(state="visible", timeout=12000)
+                page.wait_for_function(
+                    """() => {
+                      const q = '.tabs.tabs--car-img .tabs__item';
+                      const btns = document.querySelectorAll(q);
+                      return btns.length >= 3 && btns[2].classList.contains('current');
+                    }""",
+                    timeout=12_000,
+                )
+            except Exception:
+                pass
+            page.wait_for_timeout(700)
+            try:
+                page.locator(KIACAR_GALLERY_THUMB_SHOW).first.wait_for(state="visible", timeout=12_000)
             except Exception:
                 pass
     except Exception as e:
         logging.debug("[기아 갤러리 탭] 클릭 실패: %s", e)
 
-    selectors = [
-        ".thumb-flat.is-show .swiper-slide img",
-        ".thumb-flat.is-show .thumb-slide .swiper-slide img",
-        ".buy-car-detail__kv-area .thumb-flat.is-show img",
-    ]
-    for sel in selectors:
-        try:
-            imgs = page.locator(sel)
-            for i in range(imgs.count()):
-                node = imgs.nth(i)
-                _add(_safe_attr(node, "src") or _safe_attr(node, "data-src"))
-        except Exception:
-            continue
-        if urls:
-            break
+    try:
+        raw_list = page.evaluate(
+            """() => {
+              const norm = s => (s || '').trim();
+              const pick = img => {
+                if (!img) return '';
+                let u = norm(img.currentSrc);
+                if (u && !u.startsWith('data:')) return u;
+                u = norm(img.getAttribute('data-src'));
+                if (u && !u.startsWith('data:')) return u;
+                u = norm(img.getAttribute('src'));
+                if (u && !u.startsWith('data:')) return u;
+                const ss = norm(img.getAttribute('srcset'));
+                if (ss) {
+                  const first = ss.split(',')[0].trim().split(/\\s+/)[0];
+                  if (first) return first;
+                }
+                return '';
+              };
+              const show = document.querySelector('.thumb-flat.is-show');
+              if (!show) return [];
+              let swWrap = show.querySelector(
+                '.thumb-flat__wrap .thumb-slide .swiper .swiper-wrapper'
+              );
+              if (!swWrap) {
+                swWrap = show.querySelector('.thumb-flat__wrap .thumb-slide .swiper-wrapper');
+              }
+              if (!swWrap) swWrap = show.querySelector('.thumb-flat__wrap .swiper-wrapper');
+              if (!swWrap) swWrap = show.querySelector('.swiper-wrapper');
+              if (!swWrap) return [];
+              const slides = Array.from(
+                swWrap.querySelectorAll('.swiper-slide[data-swiper-slide-index]')
+              );
+              slides.sort((a, b) => {
+                const ia = parseInt(a.getAttribute('data-swiper-slide-index') || '0', 10);
+                const ib = parseInt(b.getAttribute('data-swiper-slide-index') || '0', 10);
+                return ia - ib;
+              });
+              const out = [];
+              const seenU = new Set();
+              for (const slide of slides) {
+                if (slide.classList.contains('swiper-slide-duplicate')) continue;
+                let img = slide.querySelector('.swiper-slide img');
+                if (!img) img = slide.querySelector('img');
+                const u = pick(img);
+                if (u && !seenU.has(u)) {
+                  seenU.add(u);
+                  out.push(u);
+                }
+              }
+              return out;
+            }"""
+        )
+        if isinstance(raw_list, list):
+            for u in raw_list:
+                _add(str(u or ""))
+    except Exception as e:
+        logging.debug("[기아 갤러리 URL] evaluate 실패: %s", e)
+
+    if not urls:
+        selectors = [
+            ".thumb-flat.is-show .thumb-flat__wrap .thumb-slide .swiper-wrapper "
+            ".swiper-slide[data-swiper-slide-index] .swiper-slide img",
+            ".thumb-flat.is-show .thumb-flat__wrap .thumb-slide .swiper-wrapper "
+            ".swiper-slide[data-swiper-slide-index] img",
+            ".thumb-flat.is-show .swiper-wrapper .swiper-slide[data-swiper-slide-index] .swiper-slide img",
+            ".thumb-flat.is-show .swiper-slide[data-swiper-slide-index] .swiper-slide img",
+            ".thumb-flat.is-show .swiper-slide img",
+            ".buy-car-detail__kv-area .thumb-flat.is-show .swiper-slide img",
+        ]
+        for sel in selectors:
+            try:
+                imgs = page.locator(sel)
+                for i in range(imgs.count()):
+                    _add_from_img_locator(imgs.nth(i))
+            except Exception:
+                continue
+            if urls:
+                break
 
     return urls
 
