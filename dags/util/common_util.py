@@ -566,16 +566,23 @@ AND TRIM(COALESCE(l.detail_url::text, '')) <> ''
         conn = hook.get_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    f"""
+                sql = f"""
                     UPDATE {list_table} AS l
                     SET "{col}" = %s
                     WHERE {list_where_sql}
                       {reg_extra}
                       AND TRIM(COALESCE(l."{l_key}"::text, '')) = TRIM(COALESCE(%s::text, ''))
-                    """,
-                    (value, pid),
+                    """
+                # 호출부(DAG)에서 템플릿을 추측해 찍기보다, 실제 실행되는 최종 SQL을 여기서 로그로 남긴다.
+                logger.info(
+                    "단건 complete_yn 갱신 SQL ::: %s | params(value, product_id)=(%s, %s) | policy=%s register_flag_a_only=%s",
+                    " ".join(sql.split()),
+                    value,
+                    pid,
+                    list_where_policy,
+                    register_flag_a_only,
                 )
+                cur.execute(sql, (value, pid))
                 n = int(cur.rowcount or 0)
             conn.commit()
         finally:
