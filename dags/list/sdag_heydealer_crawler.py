@@ -302,12 +302,12 @@ def heydealer_crawler():
     tn_data_clct_dtl_info_map = create_csv_process(infos)
     insert_csv_done = insert_csv_process(infos, tn_data_clct_dtl_info_map)
     # NOTE(임시): 오늘 하루만 detail DAG 자동 트리거 비활성화
-    trigger_heydealer_detail_crawl = TriggerDagRunOperator(
-        task_id="trigger_heydealer_detail_crawl",
-        trigger_dag_id="sdag_heydealer_detail_crawl",
-        wait_for_completion=False,
-    )
-    insert_csv_done >> trigger_heydealer_detail_crawl
+    # trigger_heydealer_detail_crawl = TriggerDagRunOperator(
+    #     task_id="trigger_heydealer_detail_crawl",
+    #     trigger_dag_id="sdag_heydealer_detail_crawl",
+    #     wait_for_completion=False,
+    # )
+    # insert_csv_done >> trigger_heydealer_detail_crawl
 
 
 # Airflow Variable 키
@@ -1515,6 +1515,56 @@ def download_list_image(img_url, product_id, *, api_request=None):
         return ""
 
 
+def download_list_images(img_urls: list[str], product_id: str, *, api_request=None) -> list[str]:
+    """
+    차량 카드의 모든 이미지를 다운로드 → list/{product_id}/{product_id}_list_1.png, _list_2.png, ...
+    성공한 파일의 절대 경로 리스트를 반환한다.
+    """
+    if not product_id or not img_urls:
+        return []
+    product_dir = (IMG_BASE / "list") / product_id
+    product_dir.mkdir(parents=True, exist_ok=True)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Referer": "https://www.heydealer.com/",
+    }
+    saved_paths: list[str] = []
+    for seq, raw_url in enumerate(img_urls, 1):
+        url = _normalize_heydealer_list_image_url(raw_url)
+        if not url:
+            continue
+        filename = f"{product_id}_list_{seq}.png"
+        save_path = product_dir / filename
+        try:
+            if api_request is not None:
+                resp = api_request.get(url, timeout=30_000, headers=headers)
+                if resp.status != 200:
+                    logging.warning(
+                        "목록 이미지 HTTP %s product_id=%s seq=%d url=%s",
+                        resp.status, product_id, seq, url[:160],
+                    )
+                    continue
+                save_path.write_bytes(resp.body())
+            else:
+                response = requests.get(url, stream=True, timeout=20, headers=headers)
+                if response.status_code != 200:
+                    logging.warning(
+                        "목록 이미지 HTTP %s product_id=%s seq=%d url=%s",
+                        response.status_code, product_id, seq, url[:160],
+                    )
+                    continue
+                with open(save_path, "wb") as f:
+                    for chunk in response.iter_content(1024):
+                        f.write(chunk)
+            saved_paths.append(str(save_path.resolve()))
+        except Exception as e:
+            logging.warning(
+                "목록 이미지 저장 실패 product_id=%s seq=%d url=%s err=%s",
+                product_id, seq, url[:120], e,
+            )
+    return saved_paths
+
+
 def _query_list_car_cards_snapshot(page) -> list[dict[str, str]]:
     """
     목록 카드의 필요한 값만 브라우저에서 한 번에 추출한다.
@@ -1548,8 +1598,22 @@ def _query_list_car_cards_snapshot(page) -> list[dict[str, str]]:
                   const priceArea = el.querySelector('.css-105xtr1 .css-1066lcq .css-dbu2tk');
                   const saleEl = priceArea ? priceArea.querySelector('.css-8sjynn') : null;
 
-                  let listImageUrl = '';
-                  for (const img of Array.from(el.querySelectorAll('img'))) {
+                  const listImageUrls = [];
+                  const seenUrls = new Set();
+                  // 앵커 안에 img가 없을 수 있으므로 부모 카드 컨테이너까지 탐색
+                  let imgScope = el;
+                  if (!el.querySelector('img')) {
+                    // 부모로 올라가며 img를 가진 카드 컨테이너를 찾는다
+                    let parent = el.parentElement;
+                    for (let i = 0; i < 5 && parent; i++) {
+                      if (parent.querySelector('img')) {
+                        imgScope = parent;
+                        break;
+                      }
+                      parent = parent.parentElement;
+                    }
+                  }
+                  for (const img of Array.from(imgScope.querySelectorAll('img'))) {
                     let src = '';
                     try {
                       src = ((img.currentSrc || '') + '').trim();
@@ -1571,14 +1635,9 @@ def _query_list_car_cards_snapshot(page) -> list[dict[str, str]]:
                       }
                     }
                     if (!src || src.toLowerCase().includes('svg')) continue;
-                    if (!listImageUrl) listImageUrl = src;
-                    if (
-                      src.includes('image.heydealer.com') ||
-                      src.includes('cdn.heydealer') ||
-                      src.includes('heydealer.com')
-                    ) {
-                      listImageUrl = src;
-                      break;
+                    if (!seenUrls.has(src)) {
+                      seenUrls.add(src);
+                      listImageUrls.push(src);
                     }
                   }
 
@@ -1591,7 +1650,8 @@ def _query_list_car_cards_snapshot(page) -> list[dict[str, str]]:
                     sale_price: saleEl
                       ? (saleEl.textContent || '').trim()
                       : (priceArea ? (priceArea.textContent || '').trim() : ''),
-                    list_image_url: listImageUrl,
+                    list_image_url: listImageUrls[0] || '',
+                    list_image_urls_str: listImageUrls.join('|'),
                   };
                 })
                 .filter((row) => row.href && row.model_name);
@@ -1650,6 +1710,7 @@ def _build_card_data_from_snapshot(
         "car_list": "",
         "car_imgs": "",
         "list_image_url": (card.get("list_image_url") or "").strip(),
+        "list_image_urls": [u for u in (card.get("list_image_urls_str") or "").split("|") if u.strip()],
         "car_name": "",
     }
     try:
@@ -1717,25 +1778,34 @@ def _build_card_data_from_snapshot(
     return data
 
 def _extract_card_heydealer(elem, idx, brand_map, car_type="", brand_by_name=None) -> dict:
-    data = {"model_sn": idx, "brand_id": "", "brand_name": "", "car_type": car_type, "car_list": "", "car_imgs": "", "list_image_url": "", "car_name": ""}
+    data = {"model_sn": idx, "brand_id": "", "brand_name": "", "car_type": car_type, "car_list": "", "car_imgs": "", "list_image_url": "", "list_image_urls": [], "car_name": ""}
     try:
         href = elem.get_attribute("href") or ""
         full_url = (href if href.startswith("http") else f"https://www.heydealer.com{href}").split("?")[0]
         data["product_id"] = full_url.split("/")[-1]
         data["detail_url"] = full_url
-        # 목록 카드 썸네일 이미지 URL (image.heydealer.com 등) → 이 URL로 저장해야 상세페이지 이미지가 아닌 리스트 이미지가 저장됨
-        for img in elem.query_selector_all("img"):
+        # 목록 카드의 모든 img 태그 이미지 URL 수집 (앵커 안에 없으면 부모까지 탐색)
+        img_scope = elem
+        if not elem.query_selector("img"):
+            parent = elem.evaluate_handle("el => el.parentElement")
+            for _ in range(5):
+                if parent and parent.as_element() and parent.as_element().query_selector("img"):
+                    img_scope = parent.as_element()
+                    break
+                try:
+                    parent = parent.evaluate_handle("el => el.parentElement")
+                except Exception:
+                    break
+        seen_urls: set[str] = set()
+        for img in img_scope.query_selector_all("img"):
             src = (img.get_attribute("src") or img.get_attribute("data-src") or "").strip()
             if not src or "svg" in src.lower():
                 continue
-            if "image.heydealer.com" in src or "heydealer.com" in src:
-                data["list_image_url"] = src
-                break
-        if not data["list_image_url"] and elem.query_selector("img"):
-            first_img = elem.query_selector("img")
-            src = (first_img.get_attribute("src") or first_img.get_attribute("data-src") or "").strip()
-            if src and "svg" not in src.lower():
-                data["list_image_url"] = src
+            if src not in seen_urls:
+                seen_urls.add(src)
+                data["list_image_urls"].append(src)
+                if not data["list_image_url"]:
+                    data["list_image_url"] = src
         m_box = elem.query_selector(".css-9j6363")
         if m_box:
             names = m_box.query_selector_all(".css-jk6asd")
@@ -2006,6 +2076,14 @@ def run_heydealer_job(
                             item["model_list"] = (br.get("model_list") or "").strip()
                             item["model_list_1"] = (br.get("model_list_1") or "").strip()
                             item["model_list_2"] = (br.get("model_list_2") or "").strip()
+                        if collected_this_type < 3:
+                            run_logger.info(
+                                "[디버그] product_id=%s list_image_url=%s list_image_urls=%d개 raw_keys=%s",
+                                item.get("product_id", ""),
+                                (item.get("list_image_url") or "")[:80],
+                                len(item.get("list_image_urls") or []),
+                                sorted(card.keys()),
+                            )
                         raw_list.append(item)
                         save_to_csv_append(LIST_FILE, list_fields, item)
                         collected_this_type += 1
@@ -2067,24 +2145,31 @@ def run_heydealer_job(
             total_rows = len(raw_list)
             img_every = 100
             run_logger.info("[2단계] 목록 이미지 수집 시작 (%d건, 약 %d회 진행 로그 예정)", total_rows, max(1, (total_rows + img_every - 1) // img_every))
+            total_img_count = 0
             for idx, item in enumerate(raw_list, 1):
                 if idx == 1 or idx % img_every == 0 or idx == total_rows:
-                    run_logger.info("[2단계] 목록 이미지 진행: %d/%d건", idx, total_rows)
+                    run_logger.info("[2단계] 목록 이미지 진행: %d/%d건 (누적 이미지 %d장)", idx, total_rows, total_img_count)
                 product_id = item.get("product_id", "")
-                list_image_url = (item.get("list_image_url") or "").strip()
+                list_image_urls = item.get("list_image_urls") or []
+                # fallback: list_image_urls가 비어있으면 list_image_url(단일)로 보완
+                if not list_image_urls:
+                    single_url = (item.get("list_image_url") or "").strip()
+                    if single_url:
+                        list_image_urls = [single_url]
 
-                if list_image_url:
-                    car_imgs_path = download_list_image(
-                        list_image_url, product_id, api_request=context.request
+                if list_image_urls:
+                    saved_paths = download_list_images(
+                        list_image_urls, product_id, api_request=context.request
                     )
-                    if car_imgs_path:
-                        item["car_imgs"] = car_imgs_path
+                    total_img_count += len(saved_paths)
+                    if saved_paths:
+                        item["car_imgs"] = str((IMG_BASE / "list").resolve())
                 elif product_id and idx <= 10:
                     run_logger.warning(
-                        "[2단계] list_image_url 없음 → car_imgs 스킵 (스냅샷 DOM 확인) product_id=%s",
+                        "[2단계] list_image_urls 없음 → car_imgs 스킵 (스냅샷 DOM 확인) product_id=%s",
                         product_id,
                     )
-            run_logger.info("[2단계] 목록 이미지 수집 완료 (%d건 처리)", total_rows)
+            run_logger.info("[2단계] 목록 이미지 수집 완료 (%d건 처리, 총 %d장 저장)", total_rows, total_img_count)
 
         rewrite_csv_atomic(LIST_FILE, list_fields, raw_list)
         browser.close()

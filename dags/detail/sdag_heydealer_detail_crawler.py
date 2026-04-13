@@ -11,6 +11,7 @@ from urllib.parse import urljoin
 import pendulum
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 _root = Path(__file__).resolve().parent.parent
@@ -240,7 +241,7 @@ def heydealer_detail_crawl():
                 ),
                 viewport={"width": 1920, "height": 1080},
             )
-            install_route_blocking(context)
+            install_route_blocking(context, block_resource_types=("media", "font"))
             page = context.new_page()
             page.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
@@ -298,6 +299,7 @@ def heydealer_detail_crawl():
 
                 per_detail_dir = detail_base / product_id
                 per_detail_dir.mkdir(parents=True, exist_ok=True)
+                CommonUtil.clear_image_files(per_detail_dir)
 
                 success = False
                 fail_reason: str | None = None
@@ -375,7 +377,7 @@ def heydealer_detail_crawl():
                         ),
                         viewport={"width": 1920, "height": 1080},
                     )
-                    install_route_blocking(context)
+                    install_route_blocking(context, block_resource_types=("media", "font"))
                     page = context.new_page()
                     page.add_init_script(
                         "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
@@ -473,7 +475,17 @@ def heydealer_detail_crawl():
 
     prepared = prepare_detail_crawl()
     csv_path = crawl_and_persist(prepared)
-    load_detail_csv_to_ods(csv_path)
+    loaded = load_detail_csv_to_ods(csv_path)
+
+    # 정상수집 DAG가 끝난 뒤, 재수집 DAG를 자동 트리거
+    trigger_retry = TriggerDagRunOperator(
+        task_id="trigger_heydealer_detail_retry",
+        trigger_dag_id="sdag_heydealer_detail_retry",
+        wait_for_completion=False,
+        reset_dag_run=False,
+    )
+
+    loaded >> trigger_retry
 
 
 dag_object = heydealer_detail_crawl()
@@ -767,57 +779,145 @@ def _heydealer_img_src(img_locator, page_url: str) -> str:
 
 def _collect_heydealer_detail_gallery_urls(page) -> list[str]:
     """
-    .css-1uus6sd > .css-12qft46 내부:
-    - 2번째 .css-ltrevz: ... button.css-tt5cop img.css-q38rgl
-    - 4번째 .css-ltrevz: ... .css-hf19cn .css-1a3591h img.css-158t7i4 및 .css-w9nhgi img.css-158t7i4
+    헤이딜러 상세 이미지 수집:
+    1) 관리 상태 섹션까지 스크롤
+    2) 관리 상태 섹션의 이미지 클릭 → 갤러리 모달 열림
+    3) 모달 안에서 실내/외부/하부/스크래치 탭 순회 → 각 탭의 이미지만 수집
     """
     seen: set[str] = set()
     urls: list[str] = []
-    page_url = page.url or ""
 
-    try:
-        root = page.locator(".css-1uus6sd .css-12qft46").first
-        if root.count() == 0:
-            return []
+    def _collect_modal_imgs():
+        """갤러리 모달(풀스크린 오버레이) 안의 img만 수집."""
         try:
-            root.scroll_into_view_if_needed(timeout=8000)
-            page.wait_for_timeout(150)
-        except Exception:
-            pass
-
-        ltrevz = root.locator(".css-ltrevz")
-        n_sec = ltrevz.count()
-
-        if n_sec >= 2:
-            sec = ltrevz.nth(1)
-            imgs = sec.locator(".css-5pr39e .css-1i3qy3r .css-1dpi6xl button.css-tt5cop img.css-q38rgl")
-            for i in range(imgs.count()):
-                u = _heydealer_img_src(imgs.nth(i), page_url)
+            new_urls = page.evaluate(
+                r"""() => {
+                    const out = [];
+                    const allImgs = document.querySelectorAll('img');
+                    for (const img of allImgs) {
+                        const src = img.src || img.getAttribute('data-src') || '';
+                        if (!src || src.startsWith('data:') || src.includes('svg')) continue;
+                        if (!src.includes('heydealer') && !src.includes('prnd-car')) continue;
+                        let el = img;
+                        let inModal = false;
+                        for (let i = 0; i < 15 && el; i++) {
+                            const style = window.getComputedStyle(el);
+                            if (style.position === 'fixed' || style.position === 'absolute') {
+                                const rect = el.getBoundingClientRect();
+                                if (rect.width > window.innerWidth * 0.5 && rect.height > window.innerHeight * 0.5) {
+                                    inModal = true;
+                                    break;
+                                }
+                            }
+                            el = el.parentElement;
+                        }
+                        if (inModal) out.push(src);
+                    }
+                    return out;
+                }"""
+            )
+            for u in (new_urls or []):
                 if u and u not in seen:
                     seen.add(u)
                     urls.append(u)
+        except Exception:
+            pass
 
-        if n_sec >= 4:
-            sec = ltrevz.nth(3)
-            for sel in (
-                ".css-5pr39e .css-1i3qy3r .css-hf19cn .css-1a3591h img.css-158t7i4",
-                ".css-w9nhgi img.css-158t7i4",
-            ):
-                imgs = sec.locator(sel)
-                for i in range(imgs.count()):
-                    u = _heydealer_img_src(imgs.nth(i), page_url)
-                    if u and u not in seen:
-                        seen.add(u)
-                        urls.append(u)
-    except Exception as e:
-        logging.debug("갤러리 URL 수집 실패: %s", e)
+    def _click_tab(tab_name):
+        """모달 안의 탭 버튼(실내/외부/하부/스크래치) 클릭."""
+        try:
+            return page.evaluate(
+                r"""(name) => {
+                    const buttons = document.querySelectorAll('button');
+                    for (const btn of buttons) {
+                        const span = btn.querySelector('span');
+                        const text = span ? span.textContent.trim() : btn.textContent.trim();
+                        if (text === name && btn.offsetParent !== null) {
+                            btn.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""",
+                tab_name,
+            )
+        except Exception:
+            return False
 
+    # ── 1) 관리 상태 섹션까지 스크롤 ──
+    try:
+        for _ in range(15):
+            page.evaluate("window.scrollBy(0, window.innerHeight)")
+            page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+    # ── 2) 관리 상태 섹션의 이미지 클릭 → 갤러리 모달 열기 ──
+    modal_opened = False
+    try:
+        modal_opened = page.evaluate(
+            r"""() => {
+                const allEls = document.querySelectorAll('*');
+                let conditionSection = null;
+                for (const el of allEls) {
+                    if (el.children.length === 0 && (el.textContent || '').trim() === '관리 상태') {
+                        conditionSection = el;
+                        break;
+                    }
+                }
+                if (!conditionSection) return false;
+                let parent = conditionSection.parentElement;
+                for (let i = 0; i < 10 && parent; i++) {
+                    const imgs = parent.querySelectorAll('img');
+                    for (const img of imgs) {
+                        const src = img.src || '';
+                        if (src && !src.includes('svg') && img.offsetParent !== null) {
+                            img.click();
+                            return true;
+                        }
+                    }
+                    parent = parent.parentElement;
+                }
+                return false;
+            }"""
+        )
+    except Exception:
+        pass
+
+    if not modal_opened:
+        logging.info("헤이딜러 이미지 [관리상태 이미지 클릭 실패]")
+        return urls
+
+    page.wait_for_timeout(2000)
+    logging.info("헤이딜러 이미지 [갤러리 모달 열림]")
+
+    # ── 3) 실내/외부/하부/스크래치 탭 순회 → 모달 안 이미지만 수집 ──
+    for tab_name in ["실내", "외부", "하부", "스크래치"]:
+        try:
+            before = len(urls)
+            if _click_tab(tab_name):
+                page.wait_for_timeout(1500)
+                _collect_modal_imgs()
+                logging.info(
+                    "헤이딜러 이미지 [%s 탭]: +%d건 (누적 %d건)",
+                    tab_name, len(urls) - before, len(urls),
+                )
+            else:
+                logging.debug("헤이딜러 [%s] 탭 버튼 못 찾음", tab_name)
+        except Exception:
+            pass
+
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+    logging.info("헤이딜러 상세 이미지 URL 최종 수집: %d건", len(urls))
     return urls
 
 
 def _download_detail_gallery_image(page, image_url: str, save_path: Path) -> bool:
-    if not images_enabled():
-        return False
     try:
         headers = {
             "Referer": (page.url or "https://www.heydealer.com/").split("#")[0],
@@ -1075,14 +1175,20 @@ def _crawl_one(
         except Exception as e:
             logging.debug("[섹션5] %s : %s", product_id, e)
 
-        # ── 상세 갤러리 이미지 (car_imgs=차량별 폴더 절대경로, {product_id}_1.png부터)
+        # ── 색상 + 관리상태(실내/외부/하부/스크래치) 이미지 저장 ──
         try:
             gallery_urls = _collect_heydealer_detail_gallery_urls(page)
+            saved = 0
             for gi, gurl in enumerate(gallery_urls, start=1):
                 out = detail_img_dir / f"{product_id}_{gi}.png"
-                _download_detail_gallery_image(page, gurl, out)
+                if _download_detail_gallery_image(page, gurl, out):
+                    saved += 1
+            logging.info(
+                "헤이딜러 이미지 저장: product_id=%s, 추출=%d건, 저장=%d건",
+                product_id, len(gallery_urls), saved,
+            )
         except Exception as e:
-            logging.debug("[갤러리 이미지] %s : %s", product_id, e)
+            logging.warning("헤이딜러 이미지 저장 실패 product_id=%s: %s", product_id, e)
 
     except Exception as e:
         logging.error("파싱 전체 오류: %s - %s", product_id, e)
