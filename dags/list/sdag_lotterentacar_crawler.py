@@ -16,6 +16,7 @@ import pendulum
 import requests
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from playwright.sync_api import sync_playwright
 
@@ -310,7 +311,7 @@ def lotterentacar_crawler_dag():
     def insert_csv_process(
         bsc_infos: dict[str, dict[str, Any]],
         tn_data_clct_dtl_info_map: dict[str, dict[str, Any]],
-    ) -> None:
+    ) -> dict[str, Any]:
         brand_load_result = load_csv_to_ods.override(task_id="load_brand_csv_to_ods")(
             bsc_infos,
             tn_data_clct_dtl_info_map,
@@ -328,20 +329,29 @@ def lotterentacar_crawler_dag():
             tn_data_clct_dtl_info_map,
             LOTTERENTACAR_DATST_LIST,
         )
-        sync_list_tmp_to_source.override(task_id="sync_list_tmp_to_source")(
+        sync_result = sync_list_tmp_to_source.override(task_id="sync_list_tmp_to_source")(
             bsc_infos,
             brand_load_result,
             car_type_load_result,
             list_load_result,
         )
+        return sync_result
 
     infos = insert_collect_data_info()
     tn_data_clct_dtl_info_map = create_csv_process(infos)
-    insert_csv_process(infos, tn_data_clct_dtl_info_map)
+    sync_result = insert_csv_process(infos, tn_data_clct_dtl_info_map)
+
+    trigger_detail_dag = TriggerDagRunOperator(
+        task_id="trigger_lotterentacar_detail_dag",
+        trigger_dag_id="sdag_lotterentacar_detail_crawler",
+    )
+    sync_result >> trigger_detail_dag
 
 # Airflow Variable (기존 크롤러 DAG와 동일)
 USED_CAR_SITE_NAMES_VAR = "used_car_site_names"
 CRAWL_BASE_PATH_VAR = "crawl_base_path"
+FINAL_FILE_PATH_VAR = "used_car_final_file_path"
+COLLECT_LOG_FILE_PATH_VAR = "used_car_collect_log_file_path"
 IMAGE_FILE_PATH_VAR = "used_car_image_file_path"
 LOTTERENTACAR_COLLECT_DETAIL_TABLE = "std.tn_data_clct_dtl_info"
 
@@ -377,10 +387,29 @@ def _get_variable_path(var_name: str) -> Path | None:
     return None
 
 
+def _get_result_root_path() -> Path:
+    """CSV 등 산출물: Variable used_car_final_file_path 우선, 없으면 {crawl_base_path}/crawl."""
+    direct = _get_variable_path(FINAL_FILE_PATH_VAR)
+    if direct is not None:
+        return direct
+    return _get_crawl_base_path() / "crawl"
+
+
+def _get_log_root_path() -> Path:
+    """파일 로그: Variable used_car_collect_log_file_path 우선, 없으면 {crawl_base_path}/log."""
+    direct = _get_variable_path(COLLECT_LOG_FILE_PATH_VAR)
+    if direct is not None:
+        return direct
+    return _get_crawl_base_path() / "log"
+
+
 def _get_img_root_path() -> Path:
     direct = _get_variable_path(IMAGE_FILE_PATH_VAR)
     if direct is not None:
         return direct
+    result_root = _get_result_root_path()
+    if result_root.name.lower() == "crawl":
+        return result_root.parent / "img"
     return _get_crawl_base_path() / "img"
 
 
@@ -424,7 +453,8 @@ def activate_paths_for_datst(datst_cd: str) -> None:
     """롯데렌터카 공통 crawl / log / img 루트 경로 설정 (각 Task 시작 시 호출)."""
     global RESULT_DIR, LOG_DIR, IMG_BASE, YEAR_STR, DATE_STR, RUN_TS
 
-    base = _get_crawl_base_path()
+    result_root = _get_result_root_path()
+    log_root = _get_log_root_path()
     img_root = _get_img_root_path()
     site = get_lotterentacar_site_name()
     now = datetime.now()
@@ -432,8 +462,8 @@ def activate_paths_for_datst(datst_cd: str) -> None:
     DATE_STR = now.strftime("%Y%m%d")
     RUN_TS = now.strftime("%Y%m%d%H%M")
 
-    RESULT_DIR = CommonUtil.build_dated_site_path(base / "crawl", site, now)
-    LOG_DIR = CommonUtil.build_dated_site_path(base / "log", site, now)
+    RESULT_DIR = CommonUtil.build_dated_site_path(result_root, site, now)
+    LOG_DIR = CommonUtil.build_dated_site_path(log_root, site, now)
     IMG_BASE = CommonUtil.build_year_site_path(img_root, site, now)
 
 
@@ -1129,7 +1159,6 @@ def _build_lotterentacar_list_row(
         "poststart_dt": str(item.get("postStartDt") or "").strip(),
         "postend_dt": str(item.get("postEndDt") or "").strip(),
         "detail_url": _build_lotterentacar_detail_url(item),
-        "image_url": _build_lotterentacar_image_url(item),
         "car_imgs": "",
         "date_crtr_pnttm": date_crtr_pnttm,
         "create_dt": create_dt,
@@ -1330,7 +1359,6 @@ def run_lotterentacar_list_via_ajax(result_dir: Path, logger, list_csv_path: Pat
         "promotion_price", "return_price", "price_new", "sale_type",
         "poststart_dt", "postend_dt",
         "detail_url",
-        "image_url",
         "car_imgs",
         "date_crtr_pnttm", "create_dt",
     ]
@@ -1350,7 +1378,7 @@ def run_lotterentacar_list_via_ajax(result_dir: Path, logger, list_csv_path: Pat
         )
         rows.append(row)
         product_id = str(row.get("product_id") or "").strip()
-        image_url = str(row.get("image_url") or "").strip()
+        image_url = _build_lotterentacar_image_url(item).strip()
         if product_id and image_url:
             image_url_map[product_id] = image_url
 
@@ -1394,6 +1422,8 @@ def run_lotterentacar_fetch_detail_images(result_dir: Path, logger, list_csv_pat
     with open(csv_path, "r", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         headers = list(reader.fieldnames or [])
+        if "image_url" in headers:
+            headers.remove("image_url")
         idx = headers.index("date_crtr_pnttm") if "date_crtr_pnttm" in headers else len(headers)
         if "car_imgs" not in headers:
             headers.insert(idx, "car_imgs")
@@ -1615,6 +1645,8 @@ def run_lotterentacar_update_car_name_from_list_page(page, result_dir: Path, log
     with open(csv_path, "r", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         headers = list(reader.fieldnames or [])
+        if "image_url" in headers:
+            headers.remove("image_url")
         for row in reader:
             rows.append(row)
     updated = 0
@@ -1641,9 +1673,8 @@ def run_lotterentacar_fetch_list_images(
     """
     목록 CSV 기준으로 목록 API가 제공한 이미지 URL을 병렬 다운로드하여 car_imgs를 반영한다.
 
-    - 저장 경로: imgs/.../list/{product_id}_list.png (로컬은 repo 상대 imgs, Airflow는 IMG_BASE/list)
-    - car_imgs: 상세 이미지(run_lotterentacar_fetch_detail_images)와 같이, 저장 파일 기준 경로 문자열
-      (로컬: 상대 imgs/... 가능 구간과 동일하게 resolve된 절대경로로 통일)
+    - 저장 경로: list/{product_id}/{product_id}_list.png (기준 디렉터리는 imgs/{연도}년/{사이트}/list 또는 IMG_BASE/list)
+    - car_imgs: 저장 파일의 resolve 절대경로 문자열
     """
     csv_path = list_csv_path if list_csv_path is not None else (result_dir / "lotterentacar_list.csv")
     if not csv_path.exists():
@@ -1661,8 +1692,7 @@ def run_lotterentacar_fetch_list_images(
     img_dir.mkdir(parents=True, exist_ok=True)
     img_dir_abs = str(Path(img_dir).resolve())
     logger.info(
-        "리스트(썸네일) 이미지 저장 디렉터리: %s (car_imgs=각 행 저장 파일 절대경로, 예: %s/<product_id>_list.png)",
-        img_dir_abs,
+        "리스트(썸네일) 이미지 저장 기준 디렉터리: %s (파일 형태: <product_id>/<product_id>_list.png)",
         img_dir_abs,
     )
 
@@ -1671,6 +1701,8 @@ def run_lotterentacar_fetch_list_images(
         reader = csv.DictReader(f)
         headers = list(reader.fieldnames or [])
         rows = [row for row in reader]
+    if "image_url" in headers:
+        headers.remove("image_url")
     if "car_imgs" not in headers:
         idx = headers.index("date_crtr_pnttm") if "date_crtr_pnttm" in headers else len(headers)
         headers.insert(idx, "car_imgs")
@@ -1769,7 +1801,7 @@ def run_lotterentacar_fetch_list_images(
         product_id = str(row.get("product_id") or "").strip()
         if not product_id:
             continue
-        image_url = str(image_url_map.get(product_id) or row.get("image_url") or "").strip()
+        image_url = str(image_url_map.get(product_id) or "").strip()
         image_url = _normalize_thumbnail_url(image_url)
         if image_url:
             pending_rows.append((idx, product_id, image_url))
@@ -1779,7 +1811,9 @@ def run_lotterentacar_fetch_list_images(
         return
 
     def _download_thumbnail(idx: int, product_id: str, image_url: str):
-        out_path = img_dir / f"{product_id}_list.png"
+        product_dir = img_dir / product_id
+        product_dir.mkdir(parents=True, exist_ok=True)
+        out_path = product_dir / f"{product_id}_list.png"
         # 리퍼러/오리진을 강하게 맞춰서 403 방지(현장에서 이미지 저장이 안 되는 이슈 대응)
         referers = [
             "https://tcar.lotterentacar.net/cr/search/list",
@@ -1852,7 +1886,7 @@ def run_lotterentacar_fetch_list_images(
 
     flush_csv()
     logger.info(
-        "리스트 썸네일 수집 완료: 총 %d건 처리, 썸네일 %d건 저장 (car_imgs=저장 파일 절대경로, 디렉터리=%s)",
+        "리스트 썸네일 수집 완료: 총 %d건 처리, 썸네일 %d건 저장 (car_imgs=저장 파일 절대경로, list 기준=%s)",
         total,
         saved,
         img_dir_abs,
