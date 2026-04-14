@@ -28,6 +28,7 @@ from util.playwright_util import GotoSpec, goto_with_retry, install_route_blocki
 # ═══════════════════════════════════════════════════════════════════
 
 SOURCE_LIST_TABLE = "ods.ods_car_list_lotterentacar"
+TARGET_DETAIL_TABLE = "ods.ods_car_detail_lotterentacar"
 FINAL_FILE_PATH_VAR = "used_car_final_file_path"
 IMAGE_FILE_PATH_VAR = "used_car_image_file_path"
 SITE_NAME = "롯데렌터카"
@@ -292,6 +293,67 @@ def lotterentacar_detail_retry():
         )
         return str(csv_path)
 
+    @task
+    def load_retry_csv_to_ods(csv_path: str) -> dict[str, Any]:
+        """재수집 CSV → Detail ODS append, List complete_yn 동기화 (autoinside retry와 동일 패턴)."""
+        p = Path(str(csv_path or ""))
+        if not p.is_file():
+            raise FileNotFoundError(f"재수집 CSV 적재 대상이 없습니다: {p}")
+
+        rows = _read_csv_rows(p)
+        hook = PostgresHook(postgres_conn_id="car_db_conn")
+        refresh_policy = CommonUtil.DETAIL_LIST_COMPLETE_FLAG_POLICY_NON_N_WITH_DETAIL_URL
+        if not rows:
+            logging.info(
+                "lotterentacar detail retry: CSV 데이터 행 없음 → Detail INSERT 생략, List complete_yn 동기화만. csv=%s",
+                p,
+            )
+            CommonUtil.refresh_car_list_complete_flag_vs_detail_ods(
+                hook,
+                list_table=SOURCE_LIST_TABLE,
+                detail_table=TARGET_DETAIL_TABLE,
+                list_where_policy=refresh_policy,
+            )
+            table_count = CommonUtil.get_table_row_count(hook, TARGET_DETAIL_TABLE)
+            return {
+                "done": True,
+                "target_table": TARGET_DETAIL_TABLE,
+                "row_count": 0,
+                "table_count": table_count,
+                "csv_path": str(p),
+                "skipped_insert": True,
+            }
+
+        CommonUtil.bulk_insert_detail_ods_rows(
+            hook,
+            TARGET_DETAIL_TABLE,
+            rows,
+            truncate=False,
+            allow_only_table_cols=True,
+        )
+        CommonUtil.refresh_car_list_complete_flag_vs_detail_ods(
+            hook,
+            list_table=SOURCE_LIST_TABLE,
+            detail_table=TARGET_DETAIL_TABLE,
+            list_where_policy=refresh_policy,
+        )
+        table_count = CommonUtil.get_table_row_count(hook, TARGET_DETAIL_TABLE)
+        logging.info(
+            "lotterentacar detail retry CSV → ODS 적재 완료: table=%s, inserted_rows=%d, table_count=%d, csv=%s",
+            TARGET_DETAIL_TABLE,
+            len(rows),
+            table_count,
+            p,
+        )
+        return {
+            "done": True,
+            "target_table": TARGET_DETAIL_TABLE,
+            "row_count": len(rows),
+            "table_count": table_count,
+            "csv_path": str(p),
+            "skipped_insert": False,
+        }
+
     @task_group(group_id="prepare_retry")
     def prepare_retry():
         rows = fetch_retry_targets()
@@ -302,7 +364,8 @@ def lotterentacar_detail_retry():
         return crawl_and_save_csv(target_rows)
 
     prepared = prepare_retry()
-    retry_crawl(prepared)
+    csv_path = retry_crawl(prepared)
+    load_retry_csv_to_ods(csv_path)
 
 
 dag_object = lotterentacar_detail_retry()
@@ -398,6 +461,13 @@ def _resolve_writable_csv_path(preferred: Path) -> Path:
             preferred.resolve(),
         )
         return fallback
+
+
+def _read_csv_rows(csv_path: Path) -> list[dict[str, Any]]:
+    if not csv_path.exists():
+        return []
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        return [dict(r) for r in csv.DictReader(f)]
 
 
 # ═══════════════════════════════════════════════════════════════════

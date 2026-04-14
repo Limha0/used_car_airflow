@@ -16,6 +16,7 @@ import pendulum
 from airflow.decorators import dag, task, task_group
 from airflow.exceptions import AirflowException
 from airflow.models import Variable
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 _root = Path(__file__).resolve().parent.parent
 if str(_root) not in sys.path:
@@ -374,6 +375,7 @@ def kcar_detail_crawl():
 
                 per_detail_dir = detail_img_dir / product_id
                 per_detail_dir.mkdir(parents=True, exist_ok=True)
+                CommonUtil.clear_image_files(per_detail_dir)
 
                 success = False
                 fail_reason: str | None = None
@@ -572,7 +574,17 @@ def kcar_detail_crawl():
 
     prepared = prepare_detail_crawl()
     csv_path = crawl_and_persist(prepared)
-    load_detail_csv_to_ods(csv_path)
+    loaded = load_detail_csv_to_ods(csv_path)
+
+    # 정상수집 DAG가 끝난 뒤, 재수집 DAG를 자동 트리거
+    trigger_retry = TriggerDagRunOperator(
+        task_id="trigger_kcar_detail_retry",
+        trigger_dag_id="sdag_kcar_detail_retry",
+        wait_for_completion=False,
+        reset_dag_run=False,
+    )
+
+    loaded >> trigger_retry
 
 
 dag_object = kcar_detail_crawl()
@@ -1319,69 +1331,66 @@ def _collect_kcar_slide_index_button_bg_urls(page) -> list[str]:
 
 def _collect_kcar_gallery_image_urls(page) -> list[str]:
     """
-    갤러리 이미지 수집(다운로드는 _crawl_one에서 {product_id}_1.png … 로 저장).
-    lazy-load 유도 없이 DOM 속성·인라인 style 만 읽음.
-    1) el-carousel 썸네일(data-thumbnail-item-index) — PDP 기본 트리 우선
-    2) button[data-slide-index] + background-image:url(...)
-    3) 구형 kaps-slider / kaps-item img
+    K카 상세 갤러리 이미지 URL 수집.
+    1) 썸네일 스트립: .el-carousel-thumbnail-item button 의 background-image
+    2) 메인 캐러셀: .el-carousel__item .image-wrap img 의 src
+    3) fallback: img.kcar.com 도메인 img 전체
     """
-    urls = _collect_kcar_pdp_thumbnail_urls(page)
-    if urls:
-        return urls
+    try:
+        raw_urls = page.evaluate(
+            r"""() => {
+                const seen = new Set();
+                const urls = [];
 
-    urls = _collect_kcar_slide_index_button_bg_urls(page)
-    if urls:
-        return urls
+                // 1) 썸네일 button의 background-image에서 URL 추출
+                const thumbBtns = document.querySelectorAll(
+                    '.el-carousel-thumbnail-item button[data-slide-index]'
+                );
+                for (const btn of thumbBtns) {
+                    const bg = btn.style.backgroundImage || '';
+                    const m = bg.match(/url\(["']?(.*?)["']?\)/);
+                    if (m && m[1] && !seen.has(m[1])) {
+                        seen.add(m[1]);
+                        urls.push(m[1]);
+                    }
+                }
 
-    page_url = page.url or "https://www.kcar.com/"
-    seen: set[str] = set()
+                // 2) 메인 캐러셀 img src (썸네일이 없을 때)
+                if (urls.length === 0) {
+                    const carouselImgs = document.querySelectorAll(
+                        '.el-carousel__item .image-wrap img'
+                    );
+                    for (const img of carouselImgs) {
+                        const src = img.src || img.getAttribute('data-src') || '';
+                        if (src && !src.startsWith('data:') && !seen.has(src)) {
+                            seen.add(src);
+                            urls.push(src);
+                        }
+                    }
+                }
 
-    def _append_from_imgs(imgs_locator) -> None:
-        for i in range(imgs_locator.count()):
-            img = imgs_locator.nth(i)
-            src = (img.get_attribute("data-src") or img.get_attribute("src") or "").strip()
-            src2 = _norm_img_src(src, page_url)
-            if src2 and src2 not in seen:
-                seen.add(src2)
-                urls.append(src2)
+                // 3) fallback: img.kcar.com 도메인 img 전체
+                if (urls.length === 0) {
+                    document.querySelectorAll('img').forEach(img => {
+                        const src = img.src || '';
+                        if (src && src.includes('img.kcar.com') &&
+                            !src.includes('icon') && !src.includes('logo') &&
+                            !seen.has(src)) {
+                            seen.add(src);
+                            urls.push(src);
+                        }
+                    });
+                }
 
-    root_legacy = page.locator(".carInfoGallery.pdB60").first
-    if root_legacy.count() == 0:
-        root_legacy = page.locator(".carInfoGallery").first
-    if root_legacy.count() == 0:
-        return urls
+                return urls;
+            }"""
+        )
+    except Exception as e:
+        logging.warning("kcar 이미지 URL evaluate 예외: %s", e)
+        raw_urls = []
 
-    # 구형 kaps 슬라이더
-    for sel in (
-        ".kcar-viewer-box .kaps-slider .kaps-slider-content .kaps-item div img",
-        ".kcar-viewer-box .kaps-slider-content .kaps-item div img",
-        ".kaps-slider-content .kaps-item div img",
-    ):
-        loc = root_legacy.locator(sel)
-        if loc.count() > 0:
-            _append_from_imgs(loc)
-            break
-
-    if not urls:
-        kaps_items = root_legacy.locator(".kaps-item")
-        for i in range(kaps_items.count()):
-            item = kaps_items.nth(i)
-            img = item.locator("div img").first
-            if img.count() == 0:
-                img = item.locator("img").first
-            if img.count() == 0:
-                continue
-            src = (img.get_attribute("data-src") or img.get_attribute("src") or "").strip()
-            if not src:
-                continue
-            src2 = _norm_img_src(src, page_url)
-            if src2 and src2 not in seen:
-                seen.add(src2)
-                urls.append(src2)
-
-    if not urls:
-        _append_from_imgs(root_legacy.locator("img"))
-
+    urls = [u for u in (raw_urls or []) if u]
+    logging.info("kcar 상세 이미지 URL 수집: %d건", len(urls))
     return urls
 
 
@@ -1612,17 +1621,9 @@ def _crawl_one(page, idx: int, product_id: str, detail_url: str, detail_img_dir:
             if dw:
                 data["detail_warranty"] = dw
 
-        # ── 갤러리 이미지 다운로드 (USED_CAR_SKIP_IMAGES=1 이면 스킵) ─────
+        # ── 갤러리 이미지 다운로드 ─────
         try:
             urls = _collect_kcar_gallery_image_urls(page)
-            if not urls:
-                if images_enabled():
-                    logging.warning(
-                        "kcar detail 이미지 URL 없음: product_id=%s "
-                        "(button[data-slide-index]·썸네일 셀렉터·USED_CAR_SKIP_IMAGES=%s)",
-                        product_id,
-                        os.environ.get("USED_CAR_SKIP_IMAGES", "0"),
-                    )
             if urls:
                 referer = (page.url or "").split("#")[0] or "https://www.kcar.com/"
                 ok = 0
@@ -1630,13 +1631,14 @@ def _crawl_one(page, idx: int, product_id: str, detail_url: str, detail_img_dir:
                     out = detail_img_dir / f"{product_id}_{img_idx}.png"
                     if _download_detail_image(page, img_url, out, referer=referer):
                         ok += 1
-                if ok == 0 and images_enabled():
-                    logging.warning(
-                        "kcar detail 이미지 저장 0건: product_id=%s (HTTP/URL/권한 확인)",
-                        product_id,
-                    )
-        except Exception:
-            pass
+                logging.info(
+                    "kcar 이미지 저장: product_id=%s, 추출=%d건, 저장=%d건",
+                    product_id, len(urls), ok,
+                )
+            else:
+                logging.warning("kcar 이미지 URL 없음: product_id=%s", product_id)
+        except Exception as e:
+            logging.warning("kcar 이미지 저장 실패 product_id=%s: %s", product_id, e)
 
     except Exception as e:
         if _is_playwright_dead_error(e):

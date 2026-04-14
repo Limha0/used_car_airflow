@@ -11,6 +11,7 @@ from urllib.parse import urljoin
 import pendulum
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 _root = Path(__file__).resolve().parent.parent
@@ -245,7 +246,7 @@ def kiacar_detail_crawl():
                 ),
                 viewport={"width": 1920, "height": 1080},
             )
-            install_route_blocking(context)
+            install_route_blocking(context, block_resource_types=("media", "font"))
             page = context.new_page()
             page.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
@@ -303,6 +304,7 @@ def kiacar_detail_crawl():
 
                 per_detail_dir = detail_img_dir / product_id
                 per_detail_dir.mkdir(parents=True, exist_ok=True)
+                CommonUtil.clear_image_files(per_detail_dir)
 
                 success = False
                 fail_reason: str | None = None
@@ -386,7 +388,7 @@ def kiacar_detail_crawl():
                         ),
                         viewport={"width": 1920, "height": 1080},
                     )
-                    install_route_blocking(context)
+                    install_route_blocking(context, block_resource_types=("media", "font"))
                     page = context.new_page()
                     page.add_init_script(
                         "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
@@ -482,7 +484,17 @@ def kiacar_detail_crawl():
 
     prepared = prepare_detail_crawl()
     csv_path = crawl_and_persist(prepared)
-    load_detail_csv_to_ods(csv_path)
+    loaded = load_detail_csv_to_ods(csv_path)
+
+    # 정상수집 DAG가 끝난 뒤, 재수집 DAG를 자동 트리거
+    trigger_retry = TriggerDagRunOperator(
+        task_id="trigger_kiacar_detail_retry",
+        trigger_dag_id="sdag_kiacar_detail_retry",
+        wait_for_completion=False,
+        reset_dag_run=False,
+    )
+
+    loaded >> trigger_retry
 
 
 dag_object = kiacar_detail_crawl()
@@ -633,8 +645,6 @@ def _format_improvement_h4(text: str) -> str:
 
 
 def _download_image(page, image_url: str, save_path: Path) -> bool:
-    if not images_enabled():
-        return False
     try:
         headers = {
             "Referer": (page.url or "https://cpo.kia.com/").split("#")[0],
@@ -655,161 +665,94 @@ def _download_image(page, image_url: str, save_path: Path) -> bool:
 
 def _collect_kia_tab_gallery_urls(page) -> list[str]:
     """
-    세 번째 `.tabs__item` 클릭 → 활성 탭에 `current` 부여 후,
-    `.thumb-flat.is-show` → `.thumb-flat__wrap` → `.thumb-slide` → `.swiper-wrapper` 안
-    `data-swiper-slide-index`가 있는 슬라이드(중첩 `.swiper-slide` 우선)의 `img` URL을
-    인덱스 순으로 수집한다.
+    기아 CPO 상세 이미지 수집:
+    1) '외장 360°' 탭 → data-image-list-x 에서 첫 이미지 1장
+    2) '내장 360°' 탭 → data-image-list-x 에서 첫 이미지 1장
+    3) '차량 사진' 탭 클릭 → swiper/thumb 이미지 전부
     """
-    seen: set[str] = set()
     urls: list[str] = []
-    page_url = page.url or "https://cpo.kia.com/"
+    seen: set[str] = set()
 
-    def _add(raw: str) -> None:
-        src = (raw or "").strip()
-        if not src or src.startswith("data:"):
-            return
-        if src.startswith("//"):
-            src2 = "https:" + src
-        elif src.startswith("/"):
-            src2 = urljoin(page_url, src)
-        elif not src.startswith("http"):
-            src2 = urljoin(page_url, src)
-        else:
-            src2 = src
-        if src2 not in seen:
-            seen.add(src2)
-            urls.append(src2)
+    def _add(src: str) -> None:
+        u = (src or "").strip()
+        if u and u not in seen:
+            seen.add(u)
+            urls.append(u)
 
-    def _add_from_img_locator(node) -> None:
-        try:
-            src = node.evaluate(
-                """el => {
-                  const norm = s => (s || '').trim();
-                  let u = norm(el.currentSrc);
-                  if (u && !u.startsWith('data:')) return u;
-                  u = norm(el.getAttribute('data-src'));
-                  if (u && !u.startsWith('data:')) return u;
-                  u = norm(el.getAttribute('src'));
-                  if (u && !u.startsWith('data:')) return u;
-                  const ss = norm(el.getAttribute('srcset'));
-                  if (ss) {
-                    const first = ss.split(',')[0].trim().split(/\\s+/)[0];
-                    if (first) return first;
-                  }
-                  return '';
+    # ── 1) 외장/내장 360° : data-image-list-x 에서 첫 장만 ──
+    try:
+        tab_btns = page.locator(".tabs.tabs--car-img .tabs__item")
+        n_tabs = tab_btns.count()
+
+        for tab_idx in range(min(n_tabs, 2)):  # 0=외장360, 1=내장360
+            try:
+                tab_btns.nth(tab_idx).click(timeout=5000)
+                page.wait_for_timeout(800)
+                first_url = page.evaluate(
+                    r"""() => {
+                        const el = document.querySelector('[data-image-list-x]');
+                        if (!el) return '';
+                        try {
+                            const list = JSON.parse(el.getAttribute('data-image-list-x') || '[]');
+                            return list.length > 0 ? list[0] : '';
+                        } catch(e) { return ''; }
+                    }"""
+                )
+                if first_url:
+                    _add(first_url)
+                    tab_label = "외장360" if tab_idx == 0 else "내장360"
+                    logging.info("기아 이미지 [%s]: 첫 장 수집 (누적 %d건)", tab_label, len(urls))
+            except Exception:
+                pass
+    except Exception as e:
+        logging.debug("[기아 360 탭] 수집 실패: %s", e)
+
+    # ── 2) '차량 사진' 탭 클릭 → 전체 이미지 수집 ──
+    try:
+        tab_btns = page.locator(".tabs.tabs--car-img .tabs__item")
+        n_tabs = tab_btns.count()
+        if n_tabs >= 3:
+            tab_btns.nth(2).click(timeout=8000)
+            page.wait_for_timeout(1500)
+
+            photo_urls = page.evaluate(
+                r"""() => {
+                    const seen = new Set();
+                    const urls = [];
+
+                    // swiper-slide img (thumb-flat 갤러리)
+                    const slides = document.querySelectorAll(
+                        '.thumb-flat.is-show .swiper-slide:not(.swiper-slide-duplicate) img'
+                    );
+                    for (const img of slides) {
+                        const src = img.src || img.getAttribute('data-src') || '';
+                        if (src && !src.startsWith('data:') && !seen.has(src)) {
+                            seen.add(src);
+                            urls.push(src);
+                        }
+                    }
+
+                    // fallback: cpo-cdn 도메인 img 전체
+                    if (urls.length === 0) {
+                        document.querySelectorAll('img').forEach(img => {
+                            const src = img.src || '';
+                            if (src && src.includes('cpo-cdn.kia.com') && !seen.has(src)) {
+                                seen.add(src);
+                                urls.push(src);
+                            }
+                        });
+                    }
+
+                    return urls;
                 }"""
             )
-        except Exception:
-            src = _safe_attr(node, "src") or _safe_attr(node, "data-src")
-        if src:
-            _add(str(src or ""))
-
-    tab_btns = page.locator(KIACAR_GALLERY_TAB_ITEMS)
-    if tab_btns.count() < 3:
-        tab_btns = page.locator(".tabs.tabs--car-img .tabs__item")
-
-    try:
-        if tab_btns.count() >= 3:
-            tab_btns.nth(2).click(timeout=8000)
-            try:
-                page.wait_for_function(
-                    """() => {
-                      const q = '.tabs.tabs--car-img .tabs__item';
-                      const btns = document.querySelectorAll(q);
-                      return btns.length >= 3 && btns[2].classList.contains('current');
-                    }""",
-                    timeout=12_000,
-                )
-            except Exception:
-                pass
-            page.wait_for_timeout(700)
-            try:
-                page.locator(KIACAR_GALLERY_THUMB_SHOW).first.wait_for(state="visible", timeout=12_000)
-            except Exception:
-                pass
+            for u in (photo_urls or []):
+                _add(u)
+            logging.info("기아 이미지 [차량 사진]: +%d건 (누적 %d건)", len(photo_urls or []), len(urls))
     except Exception as e:
-        logging.debug("[기아 갤러리 탭] 클릭 실패: %s", e)
+        logging.debug("[기아 차량사진 탭] 수집 실패: %s", e)
 
-    try:
-        raw_list = page.evaluate(
-            """() => {
-              const norm = s => (s || '').trim();
-              const pick = img => {
-                if (!img) return '';
-                let u = norm(img.currentSrc);
-                if (u && !u.startsWith('data:')) return u;
-                u = norm(img.getAttribute('data-src'));
-                if (u && !u.startsWith('data:')) return u;
-                u = norm(img.getAttribute('src'));
-                if (u && !u.startsWith('data:')) return u;
-                const ss = norm(img.getAttribute('srcset'));
-                if (ss) {
-                  const first = ss.split(',')[0].trim().split(/\\s+/)[0];
-                  if (first) return first;
-                }
-                return '';
-              };
-              const show = document.querySelector('.thumb-flat.is-show');
-              if (!show) return [];
-              let swWrap = show.querySelector(
-                '.thumb-flat__wrap .thumb-slide .swiper .swiper-wrapper'
-              );
-              if (!swWrap) {
-                swWrap = show.querySelector('.thumb-flat__wrap .thumb-slide .swiper-wrapper');
-              }
-              if (!swWrap) swWrap = show.querySelector('.thumb-flat__wrap .swiper-wrapper');
-              if (!swWrap) swWrap = show.querySelector('.swiper-wrapper');
-              if (!swWrap) return [];
-              const slides = Array.from(
-                swWrap.querySelectorAll('.swiper-slide[data-swiper-slide-index]')
-              );
-              slides.sort((a, b) => {
-                const ia = parseInt(a.getAttribute('data-swiper-slide-index') || '0', 10);
-                const ib = parseInt(b.getAttribute('data-swiper-slide-index') || '0', 10);
-                return ia - ib;
-              });
-              const out = [];
-              const seenU = new Set();
-              for (const slide of slides) {
-                if (slide.classList.contains('swiper-slide-duplicate')) continue;
-                let img = slide.querySelector('.swiper-slide img');
-                if (!img) img = slide.querySelector('img');
-                const u = pick(img);
-                if (u && !seenU.has(u)) {
-                  seenU.add(u);
-                  out.push(u);
-                }
-              }
-              return out;
-            }"""
-        )
-        if isinstance(raw_list, list):
-            for u in raw_list:
-                _add(str(u or ""))
-    except Exception as e:
-        logging.debug("[기아 갤러리 URL] evaluate 실패: %s", e)
-
-    if not urls:
-        selectors = [
-            ".thumb-flat.is-show .thumb-flat__wrap .thumb-slide .swiper-wrapper "
-            ".swiper-slide[data-swiper-slide-index] .swiper-slide img",
-            ".thumb-flat.is-show .thumb-flat__wrap .thumb-slide .swiper-wrapper "
-            ".swiper-slide[data-swiper-slide-index] img",
-            ".thumb-flat.is-show .swiper-wrapper .swiper-slide[data-swiper-slide-index] .swiper-slide img",
-            ".thumb-flat.is-show .swiper-slide[data-swiper-slide-index] .swiper-slide img",
-            ".thumb-flat.is-show .swiper-slide img",
-            ".buy-car-detail__kv-area .thumb-flat.is-show .swiper-slide img",
-        ]
-        for sel in selectors:
-            try:
-                imgs = page.locator(sel)
-                for i in range(imgs.count()):
-                    _add_from_img_locator(imgs.nth(i))
-            except Exception:
-                continue
-            if urls:
-                break
-
+    logging.info("기아 상세 이미지 URL 최종 수집: %d건", len(urls))
     return urls
 
 
@@ -941,14 +884,20 @@ def _crawl_one(
                 imp_parts.append(_format_improvement_h4(_safe_text(h4)))
         data["improvement"] = " | ".join([p for p in imp_parts if p])
 
-        # ── 갤러리(세 번째 탭) 이미지 저장 ─────────────────────────────
+        # ── 외장360(1장) + 내장360(1장) + 차량사진(전부) 이미지 저장 ──
         try:
-            urls = _collect_kia_tab_gallery_urls(page)
-            for i, u in enumerate(urls, 1):
+            img_urls = _collect_kia_tab_gallery_urls(page)
+            saved = 0
+            for i, u in enumerate(img_urls, 1):
                 out = detail_img_dir / f"{product_id}_{i}.png"
-                _download_image(page, u, out)
+                if _download_image(page, u, out):
+                    saved += 1
+            logging.info(
+                "기아 이미지 저장: product_id=%s, 추출=%d건, 저장=%d건",
+                product_id, len(img_urls), saved,
+            )
         except Exception as e:
-            logging.debug("[기아 갤러리 이미지] %s : %s", product_id, e)
+            logging.warning("기아 이미지 저장 실패 product_id=%s: %s", product_id, e)
 
     except Exception as e:
         logging.error("파싱 전체 오류: %s - %s", product_id, e)

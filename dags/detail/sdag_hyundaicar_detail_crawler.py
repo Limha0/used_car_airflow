@@ -11,6 +11,7 @@ from urllib.parse import urljoin
 import pendulum
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 _root = Path(__file__).resolve().parent.parent
@@ -245,7 +246,7 @@ def hyundaicar_detail_crawl():
                 ),
                 viewport={"width": 1920, "height": 1080},
             )
-            install_route_blocking(context)
+            install_route_blocking(context, block_resource_types=("media", "font"))
             page = context.new_page()
             page.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
@@ -303,6 +304,7 @@ def hyundaicar_detail_crawl():
 
                 per_detail_dir = detail_base / product_id
                 per_detail_dir.mkdir(parents=True, exist_ok=True)
+                CommonUtil.clear_image_files(per_detail_dir)
 
                 success = False
                 fail_reason: str | None = None
@@ -383,7 +385,7 @@ def hyundaicar_detail_crawl():
                         ),
                         viewport={"width": 1920, "height": 1080},
                     )
-                    install_route_blocking(context)
+                    install_route_blocking(context, block_resource_types=("media", "font"))
                     page = context.new_page()
                     page.add_init_script(
                         "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
@@ -479,7 +481,17 @@ def hyundaicar_detail_crawl():
 
     prepared = prepare_detail_crawl()
     csv_path = crawl_and_persist(prepared)
-    load_detail_csv_to_ods(csv_path)
+    loaded = load_detail_csv_to_ods(csv_path)
+
+    # 정상수집 DAG가 끝난 뒤, 재수집 DAG를 자동 트리거
+    trigger_retry = TriggerDagRunOperator(
+        task_id="trigger_hyundaicar_detail_retry",
+        trigger_dag_id="sdag_hyundaicar_detail_retry",
+        wait_for_completion=False,
+        reset_dag_run=False,
+    )
+
+    loaded >> trigger_retry
 
 
 dag_object = hyundaicar_detail_crawl()
@@ -614,8 +626,6 @@ def _join_kv_pairs(pairs: list[tuple[str, str]]) -> str:
 
 
 def _download_image(page, image_url: str, save_path: Path) -> bool:
-    if not images_enabled():
-        return False
     try:
         headers = {
             "Referer": (page.url or "https://certified.hyundai.com/").split("#")[0],
