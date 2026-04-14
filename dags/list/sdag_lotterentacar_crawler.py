@@ -1258,6 +1258,86 @@ def _collect_lotterentacar_list_items_via_ajax(logger) -> list[dict[str, Any]]:
         api_total_sum,
         last_car_total_count if last_car_total_count is not None else "N/A",
     )
+
+    # ── 한정특가(promotion=true) 전용 수집 ──
+    promo_collected = 0
+    promo_page = 1
+    promo_total = 0
+    promo_per_page = 100
+    while True:
+        promo_params = {
+            **LIST_DEFAULT_PARAMS,
+            "promotion": "true",
+            "perPageNum": str(promo_per_page),
+            "page": str(promo_page),
+            "shuffleKey": "1",
+            "_": str(int(time.time() * 1000)),
+        }
+        try:
+            r = requests.get(
+                URL_LIST,
+                params=promo_params,
+                headers=REQUEST_HEADERS,
+                timeout=LIST_API_TIMEOUT,
+            )
+            r.raise_for_status()
+            body = r.json()
+        except Exception as e:
+            logger.warning("[한정특가] API page=%d 실패: %s", promo_page, e)
+            break
+
+        result = body.get("result") or body
+        if promo_page == 1:
+            promo_total = int(
+                result.get("recordsPromotionFiltered")
+                or result.get("recordsFiltered")
+                or 0
+            )
+            logger.info("[한정특가] 수집 시작: 총 %d건 대상", promo_total)
+            if promo_total == 0:
+                break
+
+        # promotionListData + data 모두 수집 (중복은 seen_keys로 제거)
+        page_items: list[dict[str, Any]] = []
+        for item in result.get("promotionListData") or []:
+            if isinstance(item, dict):
+                page_items.append(item)
+        for item in result.get("data") or []:
+            if isinstance(item, dict):
+                page_items.append(item)
+
+        if not page_items:
+            break
+
+        new_this_page = 0
+        for item in page_items:
+            product_id = str(item.get("carId") or "").strip()
+            saletype = str(item.get("saletype") or "").strip()
+            dedupe_key = (product_id, saletype)
+            if product_id and dedupe_key in seen_keys:
+                continue
+            if product_id:
+                seen_keys.add(dedupe_key)
+            normalized = dict(item)
+            normalized["resolved_car_type"] = "한정특가"
+            items.append(normalized)
+            promo_collected += 1
+            new_this_page += 1
+
+        logger.info(
+            "[한정특가] page=%d: 응답 %d건, 신규 %d건, 누적 %d/%d",
+            promo_page, len(page_items), new_this_page, promo_collected, promo_total,
+        )
+
+        # data 기준 페이지네이션 (promotionListData는 매 페이지 동일할 수 있음)
+        data_count = len(result.get("data") or [])
+        if data_count < promo_per_page:
+            break
+        promo_page += 1
+        time.sleep(0.1)
+
+    logger.info("[한정특가] 수집 완료: 신규 %d건 (전체 누적 %d건)", promo_collected, len(items))
+
     return items
 
 

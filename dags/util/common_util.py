@@ -290,8 +290,19 @@ class CommonUtil:
           AND table_name = %s
         ORDER BY ordinal_position
         """
-        rows = hook.get_records(sql, parameters=(schema, table))
-        return [r[0] for r in rows]
+        # hook.get_records() 는 Airflow DbApiHook 이 SQL 을 INFO 로 남겨 로그가 과다해지므로
+        # 동일 쿼리는 raw cursor 로 실행한다.
+        conn = hook.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, (schema, table))
+                rows = cur.fetchall() or []
+            return [r[0] for r in rows]
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     @staticmethod
     def build_detail_list_complete_flag_where_sql(
@@ -529,12 +540,16 @@ AND TRIM(COALESCE(l.detail_url::text, '')) <> ''
         list_where_policy: str,
         list_complete_col: str = "complete_yn",
         register_flag_a_only: bool = False,
+        list_cols: set[str] | None = None,
     ) -> int:
         """
         최신 List 스냅샷(WHERE policy) 안에서 product_id 가 일치하는 행의
         complete_yn(또는 resolve 된 동일 의미 컬럼)만 Y/N 으로 갱신한다.
         """
-        list_cols = set(CommonUtil.get_ods_table_columns(hook, list_table))
+        if list_cols is None:
+            list_cols = set(CommonUtil.get_ods_table_columns(hook, list_table))
+        else:
+            list_cols = set(list_cols)
         col = CommonUtil.resolve_list_complete_column_name(list_cols, list_complete_col)
         if col is None:
             logger.warning(
@@ -573,8 +588,8 @@ AND TRIM(COALESCE(l.detail_url::text, '')) <> ''
                       {reg_extra}
                       AND TRIM(COALESCE(l."{l_key}"::text, '')) = TRIM(COALESCE(%s::text, ''))
                     """
-                # 호출부(DAG)에서 템플릿을 추측해 찍기보다, 실제 실행되는 최종 SQL을 여기서 로그로 남긴다.
-                logger.info(
+                # 상세 재수집 등에서 건별 INFO 로그가 과다하므로 DEBUG 만 남긴다.
+                logger.debug(
                     "단건 complete_yn 갱신 SQL ::: %s | params(value, product_id)=(%s, %s) | policy=%s register_flag_a_only=%s",
                     " ".join(sql.split()),
                     value,
