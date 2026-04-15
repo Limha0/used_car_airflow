@@ -1573,6 +1573,9 @@ def download_autoinside_list_image(
         return None
     if not src:
         return None
+    # SVG 플레이스홀더(이미지 없음 아이콘)는 다운로드 스킵
+    if ".svg" in src.lower():
+        return None
     if src.startswith("//"):
         src = "https:" + src
     elif src.startswith("/"):
@@ -2147,7 +2150,7 @@ def run_autoinside_list_job(
             ),
             viewport={"width": 1920, "height": 1080},
         )
-        install_route_blocking(context)
+        install_route_blocking(context, block_resource_types=("media", "font"))
         page = context.new_page()
         try:
             run_autoinside_list_by_car_type(

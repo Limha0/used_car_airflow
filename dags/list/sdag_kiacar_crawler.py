@@ -1594,7 +1594,7 @@ def run_kiacar_list_job(
     with sync_playwright() as p:
         browser = _launch_browser(p, HEADLESS_MODE)
         context = browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 800})
-        install_route_blocking(context)
+        install_route_blocking(context, block_resource_types=("media", "font"))
         page = context.new_page()
         try:
             run_kiacar_list(
