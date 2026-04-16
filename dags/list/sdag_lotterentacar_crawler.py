@@ -1120,6 +1120,57 @@ def _build_lotterentacar_image_url(item: dict[str, Any]) -> str:
     return ""
 
 
+def _format_man_won(value) -> str:
+    """숫자를 만원 단위로 포맷팅: 28470000 → '2,847만원'"""
+    try:
+        num = int(value)
+        man = num // 10000
+        return f"{man:,}만원"
+    except (ValueError, TypeError):
+        return str(value)
+
+
+def _format_won(value) -> str:
+    """숫자를 원 단위로 포맷팅: 21060000 → '21,060,000원'"""
+    try:
+        num = int(value)
+        return f"{num:,}원"
+    except (ValueError, TypeError):
+        return str(value)
+
+
+def _format_monthly_won(value) -> str:
+    """숫자를 월 단위로 포맷팅: 210000 → '월 210,000원'"""
+    try:
+        num = int(value)
+        return f"월 {num:,}원"
+    except (ValueError, TypeError):
+        return str(value)
+
+
+def _format_lotterentacar_prices(item: dict[str, Any]) -> tuple[str, str, str]:
+    """promotionPrice 유무에 따라 price_new, promotion_price, return_price 포맷팅"""
+    raw_promotion = item.get("promotionPrice")
+    raw_price_new = item.get("priceNew")
+    raw_return = item.get("returnPrice")
+
+    try:
+        promotion_val = int(raw_promotion or 0)
+    except (ValueError, TypeError):
+        promotion_val = 0
+
+    if promotion_val != 0:
+        price_new = _format_man_won(raw_price_new) if raw_price_new is not None else ""
+        promotion_price = _format_monthly_won(raw_promotion) if raw_promotion is not None else ""
+        return_price = _format_monthly_won(raw_return) if raw_return is not None else ""
+    else:
+        price_new = _format_won(raw_price_new) if raw_price_new is not None else ""
+        promotion_price = str(raw_promotion) if raw_promotion is not None else ""
+        return_price = _format_man_won(raw_return) if raw_return is not None else ""
+
+    return price_new, promotion_price, return_price
+
+
 def _build_lotterentacar_list_row(
     item: dict[str, Any],
     *,
@@ -1131,6 +1182,7 @@ def _build_lotterentacar_list_row(
     sale_type_map = {"R": "렌트", "S": "구매"}
     saletype = str(item.get("saletype") or "").strip()
     product_id = str(item.get("carId") or "").strip()
+    price_new, promotion_price, return_price = _format_lotterentacar_prices(item)
     return {
         "model_sn": model_sn,
         "product_id": product_id,
@@ -1152,9 +1204,9 @@ def _build_lotterentacar_list_row(
         "release_dt": str(item.get("regDate") or "").strip(),
         "car_navi": str(item.get("mileage") or "").strip(),
         "fuel": str(item.get("fuel") or "").strip(),
-        "promotion_price": item.get("promotionPrice") if item.get("promotionPrice") is not None else "",
-        "return_price": item.get("returnPrice") if item.get("returnPrice") is not None else "",
-        "price_new": item.get("priceNew") if item.get("priceNew") is not None else "",
+        "promotion_price": promotion_price,
+        "return_price": return_price,
+        "price_new": price_new,
         "sale_type": sale_type_map.get(saletype, saletype),
         "poststart_dt": str(item.get("postStartDt") or "").strip(),
         "postend_dt": str(item.get("postEndDt") or "").strip(),

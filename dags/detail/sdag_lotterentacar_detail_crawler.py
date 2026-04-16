@@ -40,7 +40,6 @@ SITE_NAME = "롯데렌터카"
 DETAIL_CSV_FIELDS = [
     "model_sn",
     "product_id",
-    "detail_url",
     "car_name",
     "new_car_price",
     "opt_wrap",
@@ -927,7 +926,6 @@ def _crawl_one(
     data: dict[str, Any] = {f: "" for f in DETAIL_CSV_FIELDS}
     data["model_sn"] = idx
     data["product_id"] = product_id
-    data["detail_url"] = detail_url
     data["car_imgs"] = str(detail_img_dir.resolve())
     data["date_crtr_pnttm"] = d_pnttm
     data["create_dt"] = c_dt
