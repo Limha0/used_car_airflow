@@ -816,9 +816,62 @@ def _crawl_one(
         data["line_up"] = _safe_text(price_block.locator(".total-price__tags span"))
         data["car_name"] = _safe_text(price_block.locator(".total-price__tit"))
         data["car_price"] = _safe_text(price_block.locator(".purchase-price__money span"))
-        data["car_installment"] = _safe_text(
+        # car_installment: "월 36만원 / 48개월" 형태로 추출
+        # 동적 css-* 클래스 대응 → 텍스트 패턴 기반 JS 탐색
+        _installment = _safe_text(
             price_block.locator(".calc-payment .calc-payment__detail")
         )
+        if not _installment:
+            try:
+                _installment = page.evaluate(r"""
+                    () => {
+                        const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+
+                        // 전략 1: css-* 요소에서 "월 N만원" + "N개월" 조합 추출
+                        const allEls = document.querySelectorAll('[class*="css-"]');
+                        for (const el of allEls) {
+                            if (el.offsetParent === null) continue;
+                            const full = norm(el.textContent);
+                            const m = full.match(/월\s*[\d,]+\s*만?\s*원/);
+                            const p = full.match(/\d+\s*개월/);
+                            if (m && p) {
+                                if (el.querySelectorAll('[class*="css-"]').length <= 5) {
+                                    return m[0].replace(/\s+/g, ' ').trim()
+                                        + ' / '
+                                        + p[0].replace(/\s+/g, ' ').trim();
+                                }
+                            }
+                        }
+
+                        // 전략 2: buy-car-detail 영역 내 leaf 요소 수집 후 조합
+                        const priceArea = document.querySelector('.buy-car-detail__total-price')
+                                       || document.querySelector('.buy-car-detail');
+                        if (priceArea) {
+                            let monthly = '';
+                            let period = '';
+                            const leaves = priceArea.querySelectorAll('span, p, div');
+                            for (const el of leaves) {
+                                if (el.children.length > 0) continue;
+                                const t = norm(el.textContent);
+                                if (!monthly && /월\s*[\d,]+\s*만?\s*원/.test(t)) monthly = t;
+                                if (!period && /^\d+\s*개월$/.test(t)) period = t;
+                            }
+                            if (monthly) return period ? (monthly + ' / ' + period) : monthly;
+                        }
+
+                        // 전략 3: 페이지 전체에서 "월 N원" leaf 요소
+                        const body = document.querySelectorAll('span, p, div');
+                        for (const el of body) {
+                            if (el.offsetParent === null || el.children.length > 0) continue;
+                            const t = norm(el.textContent);
+                            if (/^월\s*[\d,]+\s*만?\s*원/.test(t)) return t;
+                        }
+                        return '';
+                    }
+                """) or ""
+            except Exception:
+                _installment = ""
+        data["car_installment"] = _installment
 
         # ── car-spec (6 li) ───────────────────────────────────────────
         spec_items = root.locator(

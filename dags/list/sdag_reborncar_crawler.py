@@ -371,12 +371,15 @@ def _sync_reborncar_tmp_to_source(
     src_cols = _get_table_columns(hook, source_table)
     tmp_has_flag = flag_col in set(tmp_cols)
     src_has_flag = flag_col in set(src_cols)
-    join_condition = " AND ".join([f'COALESCE(src."{col}", \'\') = COALESCE(tmp."{col}", \'\')' for col in key_cols])
-    not_exists_condition = " AND ".join([f'COALESCE(tmp."{col}", \'\') = COALESCE(src."{col}", \'\')' for col in key_cols])
+
+    # product_id 기준 매칭 (TRIM + 빈 값 제외)
+    pk = key_cols[0]  # product_id
+    join_on_pk = f'TRIM(COALESCE(src."{pk}"::text, \'\')) = TRIM(COALESCE(tmp."{pk}"::text, \'\')) AND TRIM(COALESCE(tmp."{pk}"::text, \'\')) <> \'\''
 
     conn = hook.get_conn()
     try:
         with conn.cursor() as cur:
+            # 1) tmp에 register_flag 세팅: source에 있으면 Y, 없으면 A(신규)
             if tmp_has_flag:
                 cur.execute(
                     f"""
@@ -384,13 +387,19 @@ def _sync_reborncar_tmp_to_source(
                     SET "{flag_col}" = CASE
                         WHEN EXISTS (
                             SELECT 1 FROM {source_table} AS src
-                            WHERE {join_condition}
+                            WHERE {join_on_pk}
                         ) THEN 'Y'
                         ELSE 'A'
                     END
+                    WHERE TRIM(COALESCE(tmp."{pk}"::text, '')) <> ''
                     """
                 )
+                logging.info(
+                    "reborncar sync [1] tmp register_flag 갱신: %d건",
+                    cur.rowcount,
+                )
 
+            # 2) source 갱신: tmp에 있는 행 → 컬럼 업데이트 + register_flag = 'Y'
             update_cols = [c for c in tmp_cols if c in set(src_cols) and c not in set(key_cols)]
             set_expr = ", ".join([f'"{c}" = tmp."{c}"' for c in update_cols if c != flag_col])
             if src_has_flag:
@@ -401,10 +410,15 @@ def _sync_reborncar_tmp_to_source(
                     UPDATE {source_table} AS src
                     SET {set_expr}
                     FROM {tmp_table} AS tmp
-                    WHERE {join_condition}
+                    WHERE {join_on_pk}
                     """
                 )
+                logging.info(
+                    "reborncar sync [2] source 기존 행 Y 갱신: %d건",
+                    cur.rowcount,
+                )
 
+            # 3) 신규 INSERT: tmp에만 있고 source에 없는 행 → register_flag = 'A'
             insert_cols = [c for c in tmp_cols if c in set(src_cols)]
             if src_has_flag and flag_col not in insert_cols:
                 insert_cols.append(flag_col)
@@ -420,24 +434,37 @@ def _sync_reborncar_tmp_to_source(
                 INSERT INTO {source_table} ({cols_sql})
                 SELECT {select_cols_sql}
                 FROM {tmp_table} tmp
-                LEFT JOIN {source_table} src
-                  ON {join_condition}
-                WHERE src."{key_cols[0]}" IS NULL
-                  AND src."{key_cols[1]}" IS NULL
+                WHERE TRIM(COALESCE(tmp."{pk}"::text, '')) <> ''
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {source_table} src
+                      WHERE TRIM(COALESCE(src."{pk}"::text, '')) = TRIM(COALESCE(tmp."{pk}"::text, ''))
+                  )
                 """
             )
+            logging.info(
+                "reborncar sync [3] source 신규 A 삽입: %d건",
+                cur.rowcount,
+            )
 
+            # 4) source에만 있고 tmp에 없는 행 → register_flag = 'N' (판매 종료)
             if src_has_flag:
                 cur.execute(
                     f"""
                     UPDATE {source_table} src
                     SET "{flag_col}" = 'N'
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM {tmp_table} tmp
-                        WHERE {not_exists_condition}
-                    )
+                    WHERE TRIM(COALESCE(src."{pk}"::text, '')) <> ''
+                      AND TRIM(COALESCE(src."{flag_col}"::text, '')) <> 'N'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {tmp_table} tmp
+                          WHERE TRIM(COALESCE(tmp."{pk}"::text, '')) = TRIM(COALESCE(src."{pk}"::text, ''))
+                      )
                     """
                 )
+                logging.info(
+                    "reborncar sync [4] source 미존재 N 갱신: %d건",
+                    cur.rowcount,
+                )
+
         conn.commit()
     finally:
         try:
@@ -1233,9 +1260,7 @@ def run_reborncar_list_job(
                                             pdir.mkdir(parents=True, exist_ok=True)
                                             path = pdir / f"{v_product_id}_list.png"
                                             path.write_bytes(resp.body())
-                                            car_imgs_val = _reborncar_list_image_relpath(
-                                                v_product_id
-                                            )
+                                            car_imgs_val = str(path)
 
                             car_name_val = _normalize_composite_key(v_lp_car_name, v_lp_car_trim)
                             list_row = {

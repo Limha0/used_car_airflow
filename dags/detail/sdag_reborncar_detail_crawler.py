@@ -13,6 +13,7 @@ import pendulum
 import requests
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from playwright.sync_api import sync_playwright
 
@@ -332,6 +333,7 @@ def reborncar_detail_crawl():
 
                 per_detail_dir = detail_img_dir / product_id
                 per_detail_dir.mkdir(parents=True, exist_ok=True)
+                CommonUtil.clear_image_files(per_detail_dir)
 
                 success = False
                 fail_reason: str | None = None
@@ -509,7 +511,17 @@ def reborncar_detail_crawl():
 
     prepared = prepare_detail_crawl()
     csv_path = crawl_and_persist(prepared)
-    load_detail_csv_to_ods(csv_path)
+    loaded = load_detail_csv_to_ods(csv_path)
+
+    # 정상수집 DAG가 끝난 뒤, 재수집 DAG를 자동 트리거
+    trigger_retry = TriggerDagRunOperator(
+        task_id="trigger_reborncar_detail_retry",
+        trigger_dag_id="sdag_reborncar_detail_retry",
+        wait_for_completion=False,
+        reset_dag_run=False,
+    )
+
+    loaded >> trigger_retry
 
 
 dag_object = reborncar_detail_crawl()
@@ -661,9 +673,9 @@ def _parse_count_blocks(container_locator) -> str:
 
 
 def _parse_tire_summary(box) -> str:
-    tread_title = _safe_text(box.locator(".tire-tread .trad-title"))
+    tread_title = _safe_text(box.locator(".tire-tread .trad-title")).rstrip(" :")
     tread_val = _safe_text(box.locator(".tire-tread .trad-txt"))
-    date_title = _safe_text(box.locator(".tire-date .date-title"))
+    date_title = _safe_text(box.locator(".tire-date .date-title")).rstrip(" :")
     date_val = _safe_text(box.locator(".tire-date .date-txt"))
     return _join_kv_pairs([(tread_title, tread_val), (date_title, date_val)])
 
