@@ -51,6 +51,7 @@ DETAIL_CSV_FIELDS = [
     "car_ext_color",
     "car_int_color",
     "car_type",
+    "car_seat",
     "drive_sys",
     "car_num",
     "model_year",
@@ -928,22 +929,29 @@ def _crawl_one(
         # ── 기본 정보 (pdp03_tabs first) ──────────────────────────────────
         tabs_first = root.locator(".pdp03_tabs.first").first
         base_lis = tabs_first.locator(".cont_box2 .inner .base_01 > li")
-        base_map = [
-            "initial_registration",
-            "mileage",
-            "car_fuel",
-            "engine",
-            "car_ext_color",
-            "car_int_color",
-            "car_type",
-            "drive_sys",
-            "car_num",
-            "model_year",
-            "transmission",
-        ]
-        for i, col in enumerate(base_map):
-            if base_lis.count() > i:
-                data[col] = _safe_text(base_lis.nth(i).locator(".txt"))
+        title_to_col = {
+            "최초등록": "initial_registration",
+            "주행거리": "mileage",
+            "연료": "car_fuel",
+            "배기량": "engine",
+            "외관컬러": "car_ext_color",
+            "내장컬러": "car_int_color",
+            "차종": "car_type",
+            "승차인원": "car_seat",
+            "구동방식": "drive_sys",
+            "차량번호": "car_num",
+            "연식": "model_year",
+            "변속기": "transmission",
+        }
+        for i in range(base_lis.count()):
+            li = base_lis.nth(i)
+            tit = _safe_text(li.locator(".tit"))
+            txt = _safe_text(li.locator(".txt"))
+            if not tit:
+                continue
+            col = title_to_col.get(tit)
+            if col and txt:
+                data[col] = txt
 
         # ── history 2개 ol ────────────────────────────────────────────────
         history = root.locator(".history").first

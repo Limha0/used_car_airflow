@@ -11,6 +11,7 @@ from urllib.parse import urljoin
 import pendulum
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 _root = Path(__file__).resolve().parent.parent
@@ -246,7 +247,7 @@ def autoinside_detail_crawl():
                 ),
                 viewport={"width": 1920, "height": 1080},
             )
-            install_route_blocking(context)
+            install_route_blocking(context, block_resource_types=("media", "font"))
             page = context.new_page()
             page.add_init_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
@@ -304,6 +305,7 @@ def autoinside_detail_crawl():
 
                 per_detail_dir = detail_base / product_id
                 per_detail_dir.mkdir(parents=True, exist_ok=True)
+                CommonUtil.clear_image_files(per_detail_dir)
 
                 success = False
                 fail_reason: str | None = None
@@ -384,7 +386,7 @@ def autoinside_detail_crawl():
                         ),
                         viewport={"width": 1920, "height": 1080},
                     )
-                    install_route_blocking(context)
+                    install_route_blocking(context, block_resource_types=("media", "font"))
                     page = context.new_page()
                     page.add_init_script(
                         "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
@@ -479,7 +481,17 @@ def autoinside_detail_crawl():
 
     prepared = prepare_detail_crawl()
     csv_path = crawl_and_persist(prepared)
-    load_detail_csv_to_ods(csv_path)
+    loaded = load_detail_csv_to_ods(csv_path)
+
+    # 정상수집 DAG가 끝난 뒤, 재수집 DAG를 자동 트리거
+    trigger_retry = TriggerDagRunOperator(
+        task_id="trigger_autoinside_detail_retry",
+        trigger_dag_id="sdag_autoinside_detail_retry",
+        wait_for_completion=False,
+        reset_dag_run=False,
+    )
+
+    loaded >> trigger_retry
 
 
 dag_object = autoinside_detail_crawl()
@@ -611,8 +623,6 @@ def _collect_data_nm(li_locator) -> str:
 
 
 def _download_image(page, image_url: str, save_path: Path) -> bool:
-    if not images_enabled():
-        return False
     try:
         headers = {
             "Referer": (page.url or "https://www.autoinside.co.kr/").split("#")[0],
@@ -673,116 +683,64 @@ def _autoinside_collect_urls_from_imgs(imgs_locator, page_url: str, seen: set[st
 def _collect_autoinside_detail_gallery_urls(page, root) -> list[str]:
     """
     오토인사이드 상세 갤러리 URL 수집.
-    - 대상: `.car_view_content .section.car_img_wrap` 아래 각 `.img_section`의
-      `.main_slide .swiper-wrapper .swiper-slide` 안의 `img`(요청 DOM과 동일).
-    - 활성 탭만 보면 1장만 잡히는 경우가 있어, 모든 img_section을 클릭 순회하고
-      swiper next로 lazy 슬라이드까지 펼친 뒤 수집한다.
-    - 메인 슬라이드에서 URL이 전혀 없을 때만 썸네일 슬라이더(`thumb_slide`)를 보조로 사용한다.
+    page.evaluate 로 swiper-wrapper 안의 모든 img 태그에서 URL을 한 번에 추출한다.
+    duplicate 슬라이드는 제외하고, data-src / src 순으로 가져온다.
     """
     page_url = page.url or "https://www.autoinside.co.kr/"
-    seen: set[str] = set()
-    urls: list[str] = []
-
-    slide_img_sel = _AUTOINSIDE_MAIN_GALLERY_IMG_SEL
-    slide_img_loose = _AUTOINSIDE_MAIN_GALLERY_IMG_SEL_LOOSE
-    broad_fallback_sel = (
-        ".car_view_content .section.car_img_wrap .img_section .main_slide "
-        ".swiper-wrapper .swiper-slide img, "
-        ".car_view_content .car_img_wrap .main_slide .swiper-wrapper .swiper-slide img, "
-        ".car_view_content .car_img_wrap .main_slide img, "
-        ".car_view_content .section.car_img_wrap .main_slide img"
-    )
-
-    def collect_from_section(sec) -> None:
-        imgs = sec.locator(slide_img_sel)
-        if imgs.count() == 0:
-            imgs = sec.locator(slide_img_loose)
-        if imgs.count() == 0:
-            imgs = sec.locator(".main_slide img")
-        _autoinside_collect_urls_from_imgs(imgs, page_url, seen, urls)
-
-    def swiper_advance_slide_scope(slide_scope, gallery_wrap) -> None:
-        """다음 버튼은 종종 slide_scope 밖(.car_img_wrap 공통)에 있다."""
-        next_btn = slide_scope.locator(".swiper-button-next").first
-        if next_btn.count() == 0 and gallery_wrap.count() > 0:
-            next_btn = gallery_wrap.locator(".swiper-button-next").first
-        no_new_streak = 0
-        for _ in range(120):
-            before = len(urls)
-            try:
-                if next_btn.count() > 0:
-                    next_btn.click(timeout=2500)
-                    page.wait_for_timeout(220)
-            except Exception:
-                break
-            imgs2 = slide_scope.locator(slide_img_sel)
-            if imgs2.count() == 0:
-                imgs2 = slide_scope.locator(slide_img_loose)
-            if imgs2.count() == 0:
-                imgs2 = slide_scope.locator(".main_slide img")
-            if imgs2.count() == 0 and gallery_wrap.count() > 0:
-                imgs2 = gallery_wrap.locator(slide_img_sel)
-                if imgs2.count() == 0:
-                    imgs2 = gallery_wrap.locator(slide_img_loose)
-                if imgs2.count() == 0:
-                    imgs2 = gallery_wrap.locator(".main_slide img")
-            _autoinside_collect_urls_from_imgs(imgs2, page_url, seen, urls)
-            if len(urls) == before:
-                no_new_streak += 1
-                if no_new_streak >= 10:
-                    break
-            else:
-                no_new_streak = 0
 
     try:
-        gallery_wrap = root.locator(".car_view_content .section.car_img_wrap").first
-        if gallery_wrap.count() == 0:
-            gallery_wrap = root.locator(".car_view_content .car_img_wrap").first
-
-        sections = root.locator(".car_view_content .section.car_img_wrap .img_section")
-        n_sec = sections.count()
-        if n_sec > 0:
-            for si in range(n_sec):
-                sec = sections.nth(si)
-                try:
-                    sec.scroll_into_view_if_needed(timeout=5000)
-                except Exception:
-                    pass
-                try:
-                    sec.click(timeout=3000)
-                except Exception:
-                    try:
-                        sec.click(timeout=3000, force=True)
-                    except Exception:
-                        pass
-                page.wait_for_timeout(350)
-                collect_from_section(sec)
-                swiper_advance_slide_scope(sec, gallery_wrap)
-        elif gallery_wrap.count() > 0:
-            collect_from_section(gallery_wrap)
-            swiper_advance_slide_scope(gallery_wrap, gallery_wrap)
-
-        if not urls:
-            imgs = root.locator(broad_fallback_sel)
-            _autoinside_collect_urls_from_imgs(imgs, page_url, seen, urls)
-            wrap2 = root.locator(".section.car_img_wrap, .car_img_wrap").first
-            if wrap2.count() > 0:
-                swiper_advance_slide_scope(wrap2, wrap2)
-
-        if not urls:
-            try:
-                thumb_imgs_sel = ".thumb_slide .swiper-wrapper .swiper-slide img"
-                thumb_imgs = root.locator(thumb_imgs_sel)
-                if thumb_imgs.count() == 0:
-                    thumb_imgs = page.locator(".thumb_slide .swiper-wrapper .swiper-slide img")
-                if thumb_imgs.count() == 0:
-                    thumb_imgs = page.locator(".swiper-wrapper .swiper-slide img")
-                _autoinside_collect_urls_from_imgs(thumb_imgs, page_url, seen, urls)
-            except Exception:
-                pass
+        raw_urls = page.evaluate(
+            """
+            () => {
+              const seen = new Set();
+              const urls = [];
+              // swiper-wrapper 안의 모든 img (duplicate 슬라이드 제외)
+              const imgs = document.querySelectorAll(
+                '.swiper-wrapper .swiper-slide:not(.swiper-slide-duplicate) img'
+              );
+              for (const img of imgs) {
+                const src =
+                  (img.getAttribute('data-src') || '').trim() ||
+                  (img.getAttribute('data-original') || '').trim() ||
+                  (img.currentSrc || '').trim() ||
+                  (img.getAttribute('src') || '').trim();
+                if (!src || src.startsWith('data:') || src.toLowerCase().includes('.svg')) continue;
+                if (!seen.has(src)) {
+                  seen.add(src);
+                  urls.push(src);
+                }
+              }
+              // fallback: 위에서 못 찾으면 swiper-wrapper img 전체
+              if (urls.length === 0) {
+                const allImgs = document.querySelectorAll('.swiper-wrapper img');
+                for (const img of allImgs) {
+                  const src =
+                    (img.getAttribute('data-src') || '').trim() ||
+                    (img.getAttribute('data-original') || '').trim() ||
+                    (img.currentSrc || '').trim() ||
+                    (img.getAttribute('src') || '').trim();
+                  if (!src || src.startsWith('data:') || src.toLowerCase().includes('.svg')) continue;
+                  if (!seen.has(src)) {
+                    seen.add(src);
+                    urls.push(src);
+                  }
+                }
+              }
+              return urls;
+            }
+            """
+        )
     except Exception as e:
-        logging.debug("[갤러리 URL] 수집 예외: %s", e)
+        logging.debug("[갤러리 URL] page.evaluate 예외: %s", e)
+        raw_urls = []
 
+    urls: list[str] = []
+    for raw in (raw_urls or []):
+        u = _autoinside_norm_img_url(str(raw or ""), page_url)
+        if u and "img_car_view_no_img.svg" not in u:
+            urls.append(u)
+
+    logging.info("[갤러리 URL] swiper-wrapper img 수집: %d건", len(urls))
     return urls
 
 
@@ -942,19 +900,28 @@ def _crawl_one(
         except Exception:
             data["car_inspect"] = ""
 
-        # ── 상세 이미지 저장 (탭·swiper 전체 순회) ────────────────────────
+        # ── 상세 이미지 저장 (swiper-wrapper 내 모든 img) ──────────────────
         try:
             gallery_urls = _collect_autoinside_detail_gallery_urls(page, root)
-            logging.debug(
+            logging.info(
                 "[갤러리 이미지] %s 수집 URL %d건",
                 product_id,
                 len(gallery_urls),
             )
+            saved_count = 0
             for j, src in enumerate(gallery_urls, start=1):
                 out = detail_img_dir / f"{product_id}_{j}.png"
-                _download_image(page, src, out)
+                if _download_image(page, src, out):
+                    saved_count += 1
+            logging.info(
+                "[갤러리 이미지] %s 저장 완료 %d/%d건 → %s",
+                product_id,
+                saved_count,
+                len(gallery_urls),
+                detail_img_dir,
+            )
         except Exception as e:
-            logging.debug("[갤러리 이미지] %s : %s", product_id, e)
+            logging.warning("[갤러리 이미지] %s 예외: %s", product_id, e)
 
     except Exception as e:
         logging.error("파싱 전체 오류: %s - %s", product_id, e)

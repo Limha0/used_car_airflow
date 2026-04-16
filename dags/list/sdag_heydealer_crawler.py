@@ -40,7 +40,7 @@ def heydealer_crawler():
 
     - DB 메타(std.tn_data_bsc_info, ps00002 data4/5/6) 조회
     - 브랜드/차종은 API로 CSV 생성
-    - 목록은 playwright로 크롤링; 이미지는 목록 썸네일 1장(`list/{product_id}/{product_id}_list.png`)만.
+    - 목록은 Playwright 브라우저 내 fetch() API 페이지네이션으로 차종별 수집; 이미지는 API 응답의 image_urls로 다운로드.
     """
 
    
@@ -302,12 +302,12 @@ def heydealer_crawler():
     tn_data_clct_dtl_info_map = create_csv_process(infos)
     insert_csv_done = insert_csv_process(infos, tn_data_clct_dtl_info_map)
     # NOTE(임시): 오늘 하루만 detail DAG 자동 트리거 비활성화
-    # trigger_heydealer_detail_crawl = TriggerDagRunOperator(
-    #     task_id="trigger_heydealer_detail_crawl",
-    #     trigger_dag_id="sdag_heydealer_detail_crawl",
-    #     wait_for_completion=False,
-    # )
-    # insert_csv_done >> trigger_heydealer_detail_crawl
+    trigger_heydealer_detail_crawl = TriggerDagRunOperator(
+        task_id="trigger_heydealer_detail_crawl",
+        trigger_dag_id="sdag_heydealer_detail_crawl",
+        wait_for_completion=False,
+    )
+    insert_csv_done >> trigger_heydealer_detail_crawl
 
 
 # Airflow Variable 키
@@ -905,6 +905,20 @@ def _brand_collect_log(level: int, msg: str) -> None:
         pass
 
 
+def _brand_api_get(session, url, *, timeout=30, max_retries=3):
+    """브랜드 API GET + 재시도. 타임아웃/5xx 시 최대 max_retries회 재시도."""
+    for attempt in range(max_retries):
+        try:
+            resp = session.get(url, timeout=timeout)
+            if resp.status_code < 500:
+                return resp
+            _brand_collect_log(logging.WARNING, f"API {resp.status_code} (시도 {attempt + 1}/{max_retries}): {url[:120]}")
+        except Exception as e:
+            _brand_collect_log(logging.WARNING, f"API 요청 실패 (시도 {attempt + 1}/{max_retries}): {e}")
+        time.sleep(2 + attempt * 2)
+    return None
+
+
 def fetch_and_save_brand_csv():
     """crawl_heydealer_brand.py와 동일: API로 브랜드·모델 계층 수집 후 brand CSV 저장. 로그는 heydealer_brand_hierarchy.log 사용."""
     if BRAND_LIST_FILE.exists():
@@ -924,8 +938,9 @@ def fetch_and_save_brand_csv():
         _brand_collect_log(logging.INFO, "=" * 60)
         _brand_collect_log(logging.INFO, "헤이딜러 브랜드-모델 계층 데이터 수집 시작 (날짜 정보 포함)")
         _brand_collect_log(logging.INFO, "=" * 60)
-        brands_resp = session.get(f"{API_BASE}/brands/", timeout=15)
-        brands_resp.raise_for_status()
+        brands_resp = _brand_api_get(session, f"{API_BASE}/brands/")
+        if not brands_resp or brands_resp.status_code != 200:
+            raise RuntimeError(f"브랜드 목록 API 실패 (3회 재시도 후)")
         raw = brands_resp.json()
         brands = raw if isinstance(raw, list) else (raw.get("brands") or raw.get("data") or []) if isinstance(raw, dict) else []
         n_brands = len(brands)
@@ -934,22 +949,23 @@ def fetch_and_save_brand_csv():
             brand_id = brand.get("hash_id")
             brand_name = brand.get("name")
             _brand_collect_log(logging.INFO, f"[{b_idx}/{n_brands}] 브랜드 처리 중: {brand_name}")
-            mg_resp = session.get(f"{API_BASE}/brands/{brand_id}/", timeout=15)
-            if mg_resp.status_code != 200:
+            mg_resp = _brand_api_get(session, f"{API_BASE}/brands/{brand_id}/")
+            if not mg_resp or mg_resp.status_code != 200:
+                _brand_collect_log(logging.WARNING, f"[{b_idx}/{n_brands}] {brand_name} 모델그룹 조회 실패 → 건너뜀")
                 continue
             for mg in mg_resp.json().get("model_groups", []):
                 mg_id = mg.get("hash_id")
                 mg_name = mg.get("name")
-                sub_resp = session.get(f"{API_BASE}/model_groups/{mg_id}/", timeout=15)
-                if sub_resp.status_code != 200:
+                sub_resp = _brand_api_get(session, f"{API_BASE}/model_groups/{mg_id}/")
+                if not sub_resp or sub_resp.status_code != 200:
                     continue
                 for model in sub_resp.json().get("models", []):
                     model_id = model.get("hash_id", "")
                     model_name = model.get("name", "")
                     period = model.get("period", "")
                     # models/{model_id}/ API로 grades·details 수집 (model_list_1, model_list_2_id, model_list_2)
-                    model_resp = session.get(f"{API_BASE}/models/{model_id}/", timeout=15)
-                    if model_resp.status_code != 200:
+                    model_resp = _brand_api_get(session, f"{API_BASE}/models/{model_id}/")
+                    if not model_resp or model_resp.status_code != 200:
                         row = {
                             "model_sn": n_written + 1,
                             "brand_list": brand_name,
@@ -1072,20 +1088,35 @@ def _key_match(a, b):
 def _find_matching_brand_row(list_row, brand_matcher):
     """list 행과 brand 행 매칭:
     1) 동일: list(model_list+model_list_1+model_list_2) == brand(동일)
-    2) list model_list 앞단만(첫 단어) + model_list_1+2 로 in/find 비교
-    3) list model_list에서 앞 한 단어 지우고 나머지 + model_list_1+2 로 in/find 비교 (폭스바겐 더 뉴 파사트 → 더 뉴 파사트+... 와 brand 매칭)"""
+    2) list model_list 단독으로 brand model_list와 포함 관계 비교
+    3) list model_list 앞단만(첫 단어) + model_list_1+2 로 in/find 비교
+    4) list model_list에서 앞 한 단어 지우고 나머지 + model_list_1+2 로 in/find 비교"""
     if not brand_matcher:
         return None
     list_key = _row_key(list_row)
     list_key_trim = _row_key(list_row, trim_model_list=True)
     list_key_drop = _row_key(list_row, drop_first_word=True)
+    list_model_only = (list_row.get("model_list") or "").strip()
     exact_map = brand_matcher.get("exact", {})
     key_rows = brand_matcher.get("key_rows", [])
+    # 1) 정확히 동일
     if list_key and list_key in exact_map:
         return exact_map[list_key]
+    # 2) model_list 단독으로 brand의 key와 포함 관계 매칭 (가장 긴 매칭 우선)
+    if list_model_only:
+        best_br = None
+        best_len = 0
+        for brand_key, br in key_rows:
+            if _key_match(list_model_only, brand_key) and len(brand_key) > best_len:
+                best_br = br
+                best_len = len(brand_key)
+        if best_br:
+            return best_br
+    # 3) model_list 첫 단어만 + model_list_1+2
     for brand_key, br in key_rows:
         if _key_match(list_key_trim, brand_key):
             return br
+    # 4) model_list 첫 단어 빼고 나머지 + model_list_1+2
     for brand_key, br in key_rows:
         if _key_match(list_key_drop, brand_key):
             return br
@@ -1175,6 +1206,7 @@ def fetch_filters_car_type_entries():
             print(f"   [차종] 목록 수집용 차종 {len(entries)}개 로드 (경∙소형, 세단, SUV∙RV 등)")
     except Exception as e:
         print(f"   ⚠️ filters API 실패: {e}")
+        raise
     return entries
 
 
@@ -1212,6 +1244,7 @@ def fetch_filters_and_save_car_type_list():
             print("   ⚠️ filters API에서 car_shape 없음")
     except Exception as e:
         print(f"   ⚠️ filters API 수집 실패: {e}")
+        raise
     return entries
 
 
@@ -1881,9 +1914,6 @@ def run_heydealer_job(
     """
     global BRAND_LIST_FILE
 
-    # Airflow DAG 파싱 단계에서 playwright 미설치/무거운 import로 DAGFileProcessor가 죽는 문제 방지
-    from playwright.sync_api import sync_playwright
-
     activate_paths_for_datst((bsc.datst_cd or HEYDEALER_DATST_LIST).lower() or HEYDEALER_DATST_LIST, kwargs=kwargs)
 
     # 브랜드 CSV는 앞 단계 Task에서 생성한 파일을 그대로 쓴다 (RUN_TS 불일치로 경로가 달라지는 문제 방지)
@@ -1945,16 +1975,16 @@ def run_heydealer_job(
         car_type_entries = [(0, "")]
         run_logger.warning("filters API 실패 → 필터 없이 전체만 수집합니다.")
 
-    list_url = _build_heydealer_list_url(bsc.link_data_clct_url)
-
-    run_logger.info("[1단계] 목록 수집 (playwright)")
+    run_logger.info("[1단계] 목록 수집 (필터 UI + 무한스크롤)")
     raw_list: list[dict[str, Any]] = []
     seen: set[str] = set()
     brand_rows = load_brand_rows()
     brand_matcher = build_brand_row_matcher(brand_rows)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
             headless=True,
             args=[
                 "--disable-dev-shm-usage",
@@ -1971,6 +2001,8 @@ def run_heydealer_job(
         page = context.new_page()
         page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
+        # 메인 페이지 접속
+        list_url = _build_heydealer_list_url(bsc.link_data_clct_url)
         goto_with_retry(
             page,
             GotoSpec(
@@ -1983,196 +2015,222 @@ def run_heydealer_job(
             logger=run_logger,
             attempts=3,
         )
-        page.wait_for_timeout(600)
-        current_car_type_trigger_name = "차체"
+        page.wait_for_timeout(2000)
+
+        # 현재 필터 트리거 버튼 이름 (처음에는 "차체", 차종 선택 후에는 해당 차종명)
+        current_trigger_name = "차체"
 
         for car_type_value, car_type_name in car_type_entries:
-            display_name = car_type_name or "전체"
+            display_name = _normalize_filter_text(car_type_name) if car_type_name else "전체"
             collected_this_type = 0
-            no_new_rounds = 0
-            prev_snapshot_count = 0
-            expected_count = 0
 
-            if car_type_value:
+            if not car_type_value:
+                run_logger.info("차종 없음(전체) → 수집 시작")
+            else:
+                # 차체 필터 적용: 레이어 열기 → 초기화 → 차종 선택 → 적용
                 try:
                     expected_count = _apply_car_type_filter(
                         page,
                         display_name,
-                        current_trigger_name=current_car_type_trigger_name,
+                        current_trigger_name=current_trigger_name,
                     )
-                    current_car_type_trigger_name = display_name
+                    current_trigger_name = display_name
                     run_logger.info(
-                        f"차종 적용: {display_name} (car-shape={car_type_value}, expected_count={expected_count})"
+                        f"차종 적용: {display_name} (car-shape={car_type_value}, 보기 버튼 {expected_count}대)"
                     )
                 except Exception as e:
                     run_logger.warning(f"[{display_name}] 차체 필터 적용 실패, 건너뜀: {e}")
                     continue
-            else:
-                run_logger.info("차종 없음(전체) → 수집 시작")
+
+            # 페이지에서 전체 차량 수 추출
+            expected_total = 0
+            try:
+                page.wait_for_timeout(1000)
+                total_text = page.locator("span.css-vxq35l").first.inner_text(timeout=5000)
+                expected_total = int(re.sub(r"[^0-9]", "", total_text or ""))
+                run_logger.info(f"[{display_name}] 전체 차량 수: {expected_total}대")
+            except Exception:
+                run_logger.warning(f"[{display_name}] 전체 차량 수 추출 실패 → 스크롤 끝까지 수집")
+
+            expected_label = f"전체 {expected_total}대" if expected_total else "전체 미확인"
+
+            # 브라우저 내 fetch()로 API 직접 페이지네이션 (무한스크롤 대신)
+            page_num = 1
+            consecutive_empty = 0
+            MAX_CONSECUTIVE_EMPTY = 3
 
             while True:
-                # 안전장치: 무한 스크롤/네트워크 지연으로 과도하게 오래 도는 케이스 방지
-                # (기본 90분, 필요 시 환경변수로 조정)
-                if "_heydealer_type_start_ts" not in locals():
-                    _heydealer_type_start_ts = time.time()
-                max_type_minutes = int(os.environ.get("HEYDEALER_MAX_MINUTES_PER_TYPE", "90"))
-                if time.time() - _heydealer_type_start_ts > max_type_minutes * 60:
-                    run_logger.warning(
-                        "[%s] 차종별 최대 실행시간(%d분) 초과 → 강제 종료 (collected=%d, expected=%s)",
-                        display_name,
-                        max_type_minutes,
-                        collected_this_type,
-                        expected_count,
-                    )
-                    break
-
                 if TARGET_COUNT is not None and collected_this_type >= TARGET_COUNT:
                     run_logger.info(f"[{display_name}] 목표 {TARGET_COUNT}개 수집 완료")
                     break
-                if expected_count and collected_this_type >= expected_count:
-                    run_logger.info(f"[{display_name}] 보기 버튼 기준 {expected_count}개 수집 완료")
-                    break
 
-                prev_collected_this_type = collected_this_type
-                last_height = page.evaluate("document.body.scrollHeight")
-                last_sig = _get_list_cards_signature(page)
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                # 고정 1.2초 대기 대신, "목록이 실제로 늘어날 때"까지만 짧게 폴링한다.
-                # 빠른 날엔 곧바로 다음 단계로 진행돼 전체 시간이 크게 줄어든다.
-                for _ in range(8):  # 최대 ~1.6초
-                    page.wait_for_timeout(200)
-                    try:
-                        if page.evaluate("document.body.scrollHeight") > last_height:
-                            break
-                        # scrollHeight 변화가 없어도 카드가 교체/추가될 수 있어 시그니처도 같이 본다.
-                        if _get_list_cards_signature(page) != last_sig:
-                            break
-                    except Exception:
+                # 전체 수량 도달 시 재시도 2번 후 종료
+                if expected_total and collected_this_type >= expected_total:
+                    consecutive_empty += 1
+                    if consecutive_empty >= 2:
+                        run_logger.info(
+                            f"[{display_name}] {expected_label} 도달 완료 (수집 {collected_this_type}건) → 다음 차종으로"
+                        )
                         break
 
-                cards = _query_list_car_cards_snapshot(page)
-                if car_type_value and not cards and collected_this_type == 0:
-                    page.wait_for_timeout(300)
-                    cards = _query_list_car_cards_snapshot(page)
-                current_snapshot_count = len(cards)
+                # Playwright API로 직접 호출 (브라우저 쿠키/세션 공유)
+                api_url = f"https://market-api.heydealer.com/v2/customers/web/market/cars/?order=recommendation&view_type=image&page={page_num}"
+                if car_type_value:
+                    api_url += f"&car_shape={car_type_value}"
+
+                cars = None
+                for attempt in range(3):
+                    try:
+                        api_resp = page.request.get(api_url, timeout=30_000)
+                        if api_resp.ok:
+                            cars = api_resp.json()
+                            break
+                        run_logger.warning(
+                            "[%s] API %d (page=%d, 시도 %d/3)",
+                            display_name, api_resp.status, page_num, attempt + 1,
+                        )
+                    except Exception as e:
+                        run_logger.warning(
+                            "[%s] API 요청 실패 (page=%d, 시도 %d/3): %s",
+                            display_name, page_num, attempt + 1, e,
+                        )
+                    time.sleep(2 + attempt * 2)
+
+                if not cars or not isinstance(cars, list):
+                    consecutive_empty += 1
+                    if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
+                        run_logger.info(
+                            f"[{display_name}] 연속 {MAX_CONSECUTIVE_EMPTY}회 빈 응답 → 수집 종료 "
+                            f"(page={page_num}, 수집 {collected_this_type}건, {expected_label})"
+                        )
+                        break
+                    page_num += 1
+                    continue
+
+                consecutive_empty = 0
                 new_card_count = 0
-                for card in cards:
+
+                for car in cars:
                     if TARGET_COUNT is not None and collected_this_type >= TARGET_COUNT:
                         break
-                    href = _normalize_list_href(card.get("href") or "")
-                    if href and href not in seen:
-                        seen.add(href)
-                        item = _build_card_data_from_snapshot(
-                            card,
-                            len(raw_list) + 1,
-                            brand_map,
-                            car_type=car_type_name,
-                            brand_by_name=brand_by_name,
+                    hash_id = (car.get("hash_id") or "").strip()
+                    if not hash_id or hash_id in seen:
+                        continue
+                    seen.add(hash_id)
+
+                    detail = car.get("detail_info") or {}
+                    image_urls = detail.get("image_urls") or []
+                    model_name = (detail.get("model_name") or "").strip()
+                    model_part_name = (detail.get("model_part_name") or "").strip()
+                    grade_name = (detail.get("grade_name") or "").strip()
+                    detail_name = (detail.get("detail_name") or "").strip()
+                    grade_part_name = (detail.get("grade_part_name") or "").strip()
+
+                    year_raw = detail.get("year") or ""
+                    mileage_raw = detail.get("mileage") or ""
+                    year_str = str(year_raw).strip() if year_raw else ""
+                    km_str = f"{mileage_raw:,}km" if isinstance(mileage_raw, (int, float)) and mileage_raw else str(mileage_raw).strip()
+
+                    price_raw = car.get("price") or ""
+                    sale_price = f"{price_raw}만원" if isinstance(price_raw, (int, float)) and price_raw else str(price_raw).strip()
+
+                    detail_url = f"https://www.heydealer.com/market/cars/{hash_id}"
+                    car_name = " ".join(p for p in [model_part_name, grade_part_name] if p).strip() or model_name
+
+                    d_pnttm, c_dt = get_now_times()
+                    # 대표 이미지 1장: css-vn81jl 클래스 img에 해당하는 첫 번째 URL만 사용
+                    first_image_url = image_urls[0] if image_urls else ""
+
+                    item: dict[str, Any] = {
+                        "model_sn": len(raw_list) + 1,
+                        "product_id": hash_id,
+                        "car_type": car_type_name,
+                        "brand_list": "",
+                        "car_list": "",
+                        "model_list": model_name,
+                        "model_list_1": grade_name,
+                        "model_list_2": detail_name,
+                        "car_name": car_name,
+                        "year": year_str,
+                        "km": km_str,
+                        "sale_price": sale_price,
+                        "detail_url": detail_url,
+                        "car_imgs": "",
+                        "list_image_url": first_image_url,
+                        "date_crtr_pnttm": d_pnttm,
+                        "create_dt": c_dt,
+                    }
+
+                    if model_part_name and model_name and model_part_name.endswith(model_name):
+                        brand_name_extracted = model_part_name[: -len(model_name)].strip()
+                        if brand_name_extracted:
+                            matched = brand_map.get(model_name) or (brand_by_name.get(brand_name_extracted) if brand_by_name else None)
+                            if matched:
+                                item["brand_list"] = matched.get("brand_name", "")
+
+                    br = _find_matching_brand_row(item, brand_matcher)
+                    if br:
+                        item["brand_list"] = (br.get("brand_list") or "").strip()
+                        item["car_list"] = (br.get("car_list") or "").strip()
+                        item["model_list"] = (br.get("model_list") or "").strip()
+                        item["model_list_1"] = (br.get("model_list_1") or "").strip()
+                        item["model_list_2"] = (br.get("model_list_2") or "").strip()
+
+                    raw_list.append(item)
+                    save_to_csv_append(LIST_FILE, list_fields, item)
+                    collected_this_type += 1
+                    new_card_count += 1
+
+                run_logger.info(
+                    "목록 수집 [%s]: page=%d, new=%d (이번 차종 %d건, %s)",
+                    display_name, page_num, new_card_count, collected_this_type, expected_label,
+                )
+
+                if not new_card_count:
+                    consecutive_empty += 1
+                    if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
+                        run_logger.info(
+                            f"[{display_name}] 연속 {MAX_CONSECUTIVE_EMPTY}회 신규 0건 → 수집 종료 "
+                            f"(수집 {collected_this_type}건, {expected_label})"
                         )
-                        br = _find_matching_brand_row(item, brand_matcher)
-                        if br:
-                            item["brand_list"] = (br.get("brand_list") or "").strip()
-                            item["car_list"] = (br.get("car_list") or "").strip()
-                            item["model_list"] = (br.get("model_list") or "").strip()
-                            item["model_list_1"] = (br.get("model_list_1") or "").strip()
-                            item["model_list_2"] = (br.get("model_list_2") or "").strip()
-                        if collected_this_type < 3:
-                            run_logger.info(
-                                "[디버그] product_id=%s list_image_url=%s list_image_urls=%d개 raw_keys=%s",
-                                item.get("product_id", ""),
-                                (item.get("list_image_url") or "")[:80],
-                                len(item.get("list_image_urls") or []),
-                                sorted(card.keys()),
-                            )
-                        raw_list.append(item)
-                        save_to_csv_append(LIST_FILE, list_fields, item)
-                        collected_this_type += 1
-                        new_card_count += 1
-
-                if collected_this_type == prev_collected_this_type and current_snapshot_count <= prev_snapshot_count:
-                    no_new_rounds += 1
-                else:
-                    no_new_rounds = 0
-                prev_snapshot_count = current_snapshot_count
-
-                if TARGET_COUNT is not None:
-                    run_logger.info(
-                        f"목록 수집 [{display_name}]: {collected_this_type}/{TARGET_COUNT}대 "
-                        f"(총 {len(raw_list)}대, snapshot={current_snapshot_count}, new={new_card_count})"
-                    )
-                else:
-                    run_logger.info(
-                        f"목록 수집 [{display_name}]: {collected_this_type}대 "
-                        f"(총 {len(raw_list)}대, expected={expected_count}, snapshot={current_snapshot_count}, new={new_card_count})"
-                    )
-
-                if car_type_value and collected_this_type == 0 and prev_collected_this_type == 0:
-                    run_logger.info(f"[{display_name}] 매물 0대 → 수집 종료")
-                    break
-
-                new_height = page.evaluate("document.body.scrollHeight")
-                if new_height == last_height:
-                    page.wait_for_timeout(300)
-                    if page.evaluate("document.body.scrollHeight") == last_height:
-                        if expected_count and collected_this_type < expected_count and no_new_rounds < 3:
-                            run_logger.info(
-                                f"[{display_name}] 추가 로딩 대기 "
-                                f"(collected={collected_this_type}, expected={expected_count}, snapshot={current_snapshot_count})"
-                            )
-                            continue
-                        run_logger.info(f"[{display_name}] 페이지 끝 도달")
                         break
-                if no_new_rounds >= 3 and new_card_count == 0:
-                    run_logger.info(f"[{display_name}] 새 매물 없음 → 수집 종료")
-                    break
+
+                page_num += 1
 
             run_logger.info(
-                "[%s] 차종 목록 루프 종료 (이번 차종 누적 %d건, 전체 목록 %d건) → 다음 차종 또는 이미지 단계로 진행",
+                "[%s] 차종 목록 수집 완료 (이번 차종 %d건, 전체 목록 %d건)",
                 display_name,
                 collected_this_type,
                 len(raw_list),
             )
-            try:
-                page.evaluate("window.scrollTo(0, 0)")
-                page.keyboard.press("Escape")
-                page.wait_for_timeout(200)
-            except Exception:
-                pass
 
-        run_logger.info(f"[1단계] 목록 CSV 생성 완료: {LIST_FILE} ({len(raw_list)}건)")
+            # 다음 차종 전환을 위해 스크롤을 맨 위로 올리기
+            page.evaluate("window.scrollTo(0, 0)")
+            page.wait_for_timeout(500)
 
-        if raw_list:
-            total_rows = len(raw_list)
-            img_every = 100
-            run_logger.info("[2단계] 목록 이미지 수집 시작 (%d건, 약 %d회 진행 로그 예정)", total_rows, max(1, (total_rows + img_every - 1) // img_every))
-            total_img_count = 0
-            for idx, item in enumerate(raw_list, 1):
-                if idx == 1 or idx % img_every == 0 or idx == total_rows:
-                    run_logger.info("[2단계] 목록 이미지 진행: %d/%d건 (누적 이미지 %d장)", idx, total_rows, total_img_count)
-                product_id = item.get("product_id", "")
-                list_image_urls = item.get("list_image_urls") or []
-                # fallback: list_image_urls가 비어있으면 list_image_url(단일)로 보완
-                if not list_image_urls:
-                    single_url = (item.get("list_image_url") or "").strip()
-                    if single_url:
-                        list_image_urls = [single_url]
-
-                if list_image_urls:
-                    saved_paths = download_list_images(
-                        list_image_urls, product_id, api_request=context.request
-                    )
-                    total_img_count += len(saved_paths)
-                    if saved_paths:
-                        item["car_imgs"] = str((IMG_BASE / "list").resolve())
-                elif product_id and idx <= 10:
-                    run_logger.warning(
-                        "[2단계] list_image_urls 없음 → car_imgs 스킵 (스냅샷 DOM 확인) product_id=%s",
-                        product_id,
-                    )
-            run_logger.info("[2단계] 목록 이미지 수집 완료 (%d건 처리, 총 %d장 저장)", total_rows, total_img_count)
-
-        rewrite_csv_atomic(LIST_FILE, list_fields, raw_list)
         browser.close()
+
+    run_logger.info(f"[1단계] 목록 CSV 생성 완료: {LIST_FILE} ({len(raw_list)}건)")
+
+    if raw_list:
+        total_rows = len(raw_list)
+        img_every = 100
+        run_logger.info("[2단계] 목록 이미지 수집 시작 (%d건)", total_rows)
+        total_img_count = 0
+        for idx, item in enumerate(raw_list, 1):
+            if idx == 1 or idx % img_every == 0 or idx == total_rows:
+                run_logger.info("[2단계] 목록 이미지 진행: %d/%d건 (누적 %d장)", idx, total_rows, total_img_count)
+            product_id = item.get("product_id", "")
+            img_url = (item.get("list_image_url") or "").strip()
+
+            if img_url and product_id:
+                saved_path = download_list_image(img_url, product_id)
+                if saved_path:
+                    item["car_imgs"] = saved_path
+                    total_img_count += 1
+        run_logger.info("[2단계] 목록 이미지 수집 완료 (%d건 처리, %d장 저장)", total_rows, total_img_count)
+
+    rewrite_csv_atomic(LIST_FILE, list_fields, raw_list)
 
     return {
         "brand_csv": str(BRAND_LIST_FILE),

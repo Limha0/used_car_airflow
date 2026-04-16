@@ -967,10 +967,12 @@ def _norm(s):
 
 def load_brand_nm_mapping(result_dir: Path, brand_path: Path | None = None):
     """
-    autoinside_brand_list.csv에서 brand_list, model_list 컬럼을 읽어
-    이은 값(brand_list + ' ' + model_list, 공백 정규화)을 키로,
-    (brand_list, car_list, model_list)를 값으로 하는 딕셔너리 반환.
-    list.csv의 car_name에 해당 키가 포함되면 해당 행의 brand_list, car_list, model_list에 매칭값 채움.
+    autoinside_brand_list.csv에서 매칭용 딕셔너리를 생성.
+    키 우선순위 (구체적 → 일반적, 먼저 등록된 것 유지):
+      1) brand_list + ' ' + model_list  (예: '현대 디 올 뉴 그랜저')
+      2) brand_list + ' ' + car_list    (예: '현대 그랜저')
+      3) model_list 단독               (예: '디 올 뉴 그랜저')
+      4) car_list 단독                  (예: '그랜저')
     """
     csv_path = brand_path if brand_path is not None else (result_dir / "autoinside_brand_list.csv")
     out = {}
@@ -983,9 +985,10 @@ def load_brand_nm_mapping(result_dir: Path, brand_path: Path | None = None):
                 bl = (row.get("brand_list") or "").strip()
                 cl = (row.get("car_list") or "").strip()
                 ml = (row.get("model_list") or "").strip()
-                key = _norm(bl + " " + ml)
-                if key:
-                    out[key] = {"brand_list": bl, "car_list": cl, "model_list": ml}
+                val = {"brand_list": bl, "car_list": cl, "model_list": ml}
+                for key in [_norm(bl + " " + ml), _norm(bl + " " + cl), _norm(ml), _norm(cl)]:
+                    if key and key not in out:
+                        out[key] = val
     except Exception:
         pass
     return out
@@ -993,8 +996,10 @@ def load_brand_nm_mapping(result_dir: Path, brand_path: Path | None = None):
 
 def find_brand_match(nm_norm: str, brand_nm_map: dict):
     """
-    brand_nm_map의 키(brand_list+model_list 이은 문자열)가 nm_norm(car_name)에 포함되어 있으면
-    해당 brand_list, car_list, model_list를 반환. 여러 개 매칭 시 가장 긴 키(가장 구체적) 선택.
+    brand_nm_map의 키가 nm_norm(car_name)에 포함되어 있으면
+    해당 brand_list, car_list, model_list를 반환.
+    여러 개 매칭 시 가장 긴 키(가장 구체적) 선택.
+    매칭 실패 시 None 반환 (brand.csv에 없는 값은 넣지 않음).
     """
     if not nm_norm or not brand_nm_map:
         return None
@@ -1003,7 +1008,7 @@ def find_brand_match(nm_norm: str, brand_nm_map: dict):
         if key and key in nm_norm:
             if match_key is None or len(key) > len(match_key):
                 match_key = key
-    return brand_nm_map.get(match_key) if match_key else None
+    return brand_nm_map[match_key] if match_key else None
 
 
 def _get_file_logger(run_ts: str) -> logging.Logger:
@@ -1347,13 +1352,12 @@ def run_autoinside_brand_list(page, result_dir: Path, logger, csv_path: Path | N
                 if not clicked:
                     continue
 
+                # 차종 목록이 DOM에 붙을 때까지 대기
+                brnd_locator = page.locator(f'input[data-type="brnd"][data-previd="{mnfc_value}"]')
                 try:
-                    page.locator('input[data-type="brnd"]').first.wait_for(state="visible", timeout=5000)
+                    brnd_locator.first.wait_for(state="attached", timeout=5000)
                 except Exception:
                     pass
-
-                # 이 제조사 하위 차종만 (data-previd가 mnfc_value인 brnd)
-                brnd_locator = page.locator(f'input[data-type="brnd"][data-previd="{mnfc_value}"]')
                 brnd_count = brnd_locator.count()
                 if brnd_count == 0:
                     total_rows += 1
@@ -1419,6 +1423,10 @@ def run_autoinside_brand_list(page, result_dir: Path, logger, csv_path: Path | N
                         # 이 차종 하위 모델 (data-previd="mnfc_value,brnd_value")
                         previd_prefix = mnfc_value + "," + brnd_value
                         model_inputs = page.locator(f'input[data-type="model"][data-previd="{previd_prefix}"]')
+                        try:
+                            model_inputs.first.wait_for(state="attached", timeout=3000)
+                        except Exception:
+                            pass
                         model_count = model_inputs.count()
 
                         if model_count == 0:

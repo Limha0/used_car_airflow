@@ -1154,7 +1154,11 @@ def run_hyundaicar_brand_list(page, result_dir: Path, logger, csv_path: Path | N
         all_rows: list[dict[str, Any]] = []
         model_sn = 1
 
+        # 현대, 제네시스만 수집
+        target_brands = ("현대", "제네시스")
         for brand_name in brand_names:
+            if brand_name not in target_brands:
+                continue
             if not _select_brand(page, brand_name):
                 logger.warning("[%s] 브랜드 선택 실패", brand_name)
                 continue

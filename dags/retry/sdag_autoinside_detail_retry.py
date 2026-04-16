@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
 import pendulum
 from airflow.decorators import dag, task, task_group
@@ -23,14 +24,23 @@ from util.playwright_util import GotoSpec, goto_with_retry, images_enabled, inst
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  상수 (현대차 상세 재수집)
+#  상수 (오토인사이드 상세 재수집)
 # ═══════════════════════════════════════════════════════════════════
 
-SOURCE_LIST_TABLE = "ods.ods_car_list_hyundaicar"
-TARGET_DETAIL_TABLE = "ods.ods_car_detail_hyundaicar"
+SOURCE_LIST_TABLE = "ods.ods_car_list_autoinside"
+TARGET_DETAIL_TABLE = "ods.ods_car_detail_autoinside"
 FINAL_FILE_PATH_VAR = "used_car_final_file_path"
 IMAGE_FILE_PATH_VAR = "used_car_image_file_path"
-SITE_NAME = "현대차"
+SITE_NAME = "오토인사이드"
+
+# autoinside 상세 페이지 루트
+_AUTOINSIDE_DETAIL_ROOT_SEL = ".carView.on #wrap #frm .container .container_inn .page.car_view_wrap"
+_AUTOINSIDE_DETAIL_ROOT_SEL_CARVIEW = ".carView #wrap #frm .container .container_inn .page.car_view_wrap"
+_AUTOINSIDE_DETAIL_ROOT_FALLBACK = "#wrap #frm .container .container_inn .page.car_view_wrap"
+
+# main gallery fallback selectors
+_AUTOINSIDE_MAIN_GALLERY_IMG_SEL = ".main_slide .swiper-wrapper .swiper-slide:not(.swiper-slide-duplicate) img"
+_AUTOINSIDE_MAIN_GALLERY_IMG_SEL_LOOSE = ".main_slide .swiper-slide:not(.swiper-slide-duplicate) img"
 
 DETAIL_CSV_FIELDS = [
     "model_sn",
@@ -38,32 +48,15 @@ DETAIL_CSV_FIELDS = [
     "car_name",
     "year",
     "km",
-    "car_pay",
-    "installment",
-    "operation_period",
-    "manufacturer_guarantee",
-    "inspection",
-    "accident_history",
-    "initial_registration",
-    "mileage",
-    "car_fuel",
-    "engine",
-    "car_ext_color",
-    "car_int_color",
-    "car_type",
-    "car_seat",
-    "drive_sys",
+    "car_spec",
     "car_num",
-    "model_year",
-    "transmission",
-    "car_history_1",
-    "car_history_2",
-    "car_report_1",
-    "car_report_2",
-    "notice",
-    "guarantee_1",
-    "guarantee_2",
-    "options",
+    "car_color",
+    "category",
+    "inspection",
+    "insurance",
+    "car_opt",
+    "car_history",
+    "car_inspect",
     "car_imgs",
     "date_crtr_pnttm",
     "create_dt",
@@ -76,37 +69,35 @@ DETAIL_CSV_FIELDS = [
 
 
 @dag(
-    dag_id="sdag_hyundaicar_detail_retry",
+    dag_id="sdag_autoinside_detail_retry",
     schedule=None,
     start_date=pendulum.datetime(2026, 3, 1, tz="Asia/Seoul"),
     catchup=False,
-    tags=["used_car", "hyundaicar", "detail", "retry"],
+    tags=["used_car", "autoinside", "detail", "retry"],
 )
-def hyundaicar_detail_retry():
+def autoinside_detail_retry():
     """
-    현대차 상세 재수집:
-    - complete_yn != 'Y' (NULL 포함)
+    오토인사이드 상세 재수집:
+    - list에서 complete_yn != 'Y'
     - register_flag != 'N' (NULL 포함)
-    - detail_url 존재(널/공백 제외)
-    대상 행을 다시 상세 수집하여 CSV를 생성하고, 수집 성공/실패에 따라 list complete_yn을 단건 갱신한다.
+    - detail_url 존재
+    인 행만 다시 상세 수집하여 CSV를 생성하고, 수집 성공/실패에 따라 list complete_yn을 단건 갱신한다.
     """
 
     @task
     def fetch_retry_targets() -> list[dict[str, str]]:
         sql = f"""
-        SELECT
-            l.product_id,
-            l.detail_url,
-            l.register_flag,
-            l.complete_yn
-        FROM {SOURCE_LIST_TABLE} l
-        WHERE (l.complete_yn IS NULL OR TRIM(COALESCE(l.complete_yn::text, '')) <> 'Y')
-          AND (l.register_flag IS NULL OR TRIM(COALESCE(l.register_flag::text, '')) <> 'N')
-          AND l.detail_url IS NOT NULL
-          AND TRIM(COALESCE(l.detail_url::text, '')) <> ''
-        ORDER BY l.model_sn
+        select 
+            *
+        from ods.ods_car_list_autoinside
+        where 1=1
+            and (register_flag IS NULL OR TRIM(register_flag) <> 'N')
+            and (complete_yn IS NULL OR TRIM(complete_yn) <> 'Y')
+            and detail_url IS NOT null
+            AND TRIM(COALESCE(detail_url::text, '')) <> ''
+        order by model_sn
         """
-        logging.info("hyundaicar detail retry select_stmt ::: %s", sql)
+        logging.info("autoinside detail retry select_stmt ::: %s", sql)
         hook = PostgresHook(postgres_conn_id="car_db_conn")
         conn = hook.get_conn()
         rows: list[dict[str, str]] = []
@@ -122,7 +113,7 @@ def hyundaicar_detail_retry():
             except Exception:
                 pass
 
-        logging.info("hyundaicar detail retry 재수집 대상: %d건", len(rows))
+        logging.info("==== 오토인사이드 상세 재수집 대상: %d건 ====", len(rows) )
         if not rows:
             logging.info("재수집 대상 0건 — 정상 종료로 진행합니다.")
         return rows
@@ -131,19 +122,21 @@ def hyundaicar_detail_retry():
     def summarize_targets(target_rows: list[dict[str, str]]) -> list[dict[str, str]]:
         n = len(target_rows)
         with_url = sum(1 for r in target_rows if str(r.get("detail_url") or "").strip())
+        # 이번 DAG에서 "재수집되어야 하는" 대상 건수는 n (fetch 조건으로 이미 필터링된 수)
         logging.info("재수집 대상 총 건수: %d", n)
         logging.info("재수집 준비: 대상=%d건(재수집 필요), detail_url 있음 %d건", n, with_url)
         return target_rows
 
     @task
     def crawl_and_save_csv(target_rows: list[dict[str, str]]) -> str:
+        # DAG 파싱 단계에서 playwright import로 DAGFileProcessor가 죽는 문제 방지
         from playwright.sync_api import sync_playwright
 
         output_dir = _get_output_dir()
         output_dir.mkdir(parents=True, exist_ok=True)
         run_ts = datetime.now().strftime("%Y%m%d%H%M")
-        csv_path = output_dir / f"hyundaicar_detail_retry_{run_ts}.csv"
-        logging.info("hyundaicar detail retry 출력 CSV: %s", csv_path.resolve())
+        csv_path = output_dir / f"autoinside_detail_retry_{run_ts}.csv"
+        logging.info("autoinside detail retry 출력 CSV: %s", csv_path.resolve())
 
         detail_base = _get_detail_img_dir()
         detail_base.mkdir(parents=True, exist_ok=True)
@@ -170,12 +163,11 @@ def hyundaicar_detail_retry():
         collected = 0
         failed = 0
         skipped = 0
-        recycle_every = 300
         pg_hook = PostgresHook(postgres_conn_id="car_db_conn")
         list_cols_for_complete_yn = set(
             CommonUtil.get_ods_table_columns(pg_hook, SOURCE_LIST_TABLE)
         )
-        logging.info("hyundaicar detail retry 재수집 처리 시작 — 총 건수: %d", total)
+        logging.info("autoinside detail retry 재수집 처리 시작 — 총 건수: %d", total)
 
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -216,7 +208,7 @@ def hyundaicar_detail_retry():
                 try:
                     detail_data = _crawl_one(page, idx, product_id, detail_url, per_detail_dir)
                     if detail_data:
-                        _save_to_csv_append(csv_path, DETAIL_CSV_FIELDS, detail_data)
+                        _save_to_csv_append(Path(csv_path), DETAIL_CSV_FIELDS, detail_data)
                         success = True
                         collected += 1
                     else:
@@ -240,12 +232,13 @@ def hyundaicar_detail_retry():
                             list_table=SOURCE_LIST_TABLE,
                             product_id=product_id,
                             value=yn,
+                            # 재수집은 최신 스냅샷 강제 없이, non-n+detail_url 정책으로 단건 갱신
                             list_where_policy=CommonUtil.DETAIL_LIST_COMPLETE_FLAG_POLICY_NON_N_WITH_DETAIL_URL,
                             register_flag_a_only=False,
                             list_cols=list_cols_for_complete_yn,
                         )
                         # logging.info(
-                        #     "hyundaicar detail retry update_result ::: product_id=%s complete_yn=%s updated_rows=%d",
+                        #     "==== 오토인사이드 상세 재수집 complete_yn 갱신 결과 ::: product_id=%s complete_yn=%s updated_rows=%d ====",
                         #     product_id,
                         #     yn,
                         #     int(n or 0),
@@ -274,29 +267,6 @@ def hyundaicar_detail_retry():
                         failed,
                         skipped,
                     )
-
-                if idx % recycle_every == 0 and idx < total:
-                    try:
-                        page.close()
-                    except Exception:
-                        pass
-                    try:
-                        context.close()
-                    except Exception:
-                        pass
-                    context = browser.new_context(
-                        user_agent=(
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/122.0.0.0 Safari/537.36"
-                        ),
-                        viewport={"width": 1920, "height": 1080},
-                    )
-                    install_route_blocking(context, block_resource_types=("media", "font"))
-                    page = context.new_page()
-                    page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-                    logging.info("브라우저 컨텍스트 재생성 완료: processed=%d/%d", idx, total)
-
                 time.sleep(0.2)
 
             try:
@@ -307,7 +277,7 @@ def hyundaicar_detail_retry():
         if not Path(csv_path).exists():
             raise FileNotFoundError(f"CSV 생성 실패: {csv_path}")
         logging.info(
-            "✅ hyundaicar detail retry 완료: collected=%d failed=%d skipped=%d total=%d csv=%s",
+            "✅ autoinside detail retry 완료: collected=%d failed=%d skipped=%d total=%d csv=%s",
             collected,
             failed,
             skipped,
@@ -328,7 +298,7 @@ def hyundaicar_detail_retry():
         refresh_policy = CommonUtil.DETAIL_LIST_COMPLETE_FLAG_POLICY_NON_N_WITH_DETAIL_URL
         if not rows:
             logging.info(
-                "hyundaicar detail retry: CSV 데이터 행 없음 → Detail INSERT 생략, List complete_yn 동기화만. csv=%s",
+                "autoinside detail retry: CSV 데이터 행 없음 → Detail INSERT 생략, List complete_yn 동기화만. csv=%s",
                 p,
             )
             CommonUtil.refresh_car_list_complete_flag_vs_detail_ods(
@@ -362,7 +332,7 @@ def hyundaicar_detail_retry():
         )
         table_count = CommonUtil.get_table_row_count(hook, TARGET_DETAIL_TABLE)
         logging.info(
-            "hyundaicar detail retry CSV → ODS 적재 완료: table=%s, inserted_rows=%d, table_count=%d, csv=%s",
+            "autoinside detail retry CSV → ODS 적재 완료: table=%s, inserted_rows=%d, table_count=%d, csv=%s",
             TARGET_DETAIL_TABLE,
             len(rows),
             table_count,
@@ -391,11 +361,11 @@ def hyundaicar_detail_retry():
     load_retry_csv_to_ods(csv_path)
 
 
-dag_object = hyundaicar_detail_retry()
+dag_object = autoinside_detail_retry()
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  경로/CSV 유틸
+#  경로/CSV/파싱 유틸 (재수집에 필요한 최소 범위)
 # ═══════════════════════════════════════════════════════════════════
 
 
@@ -443,7 +413,10 @@ def _csv_cell_excel_text(val: Any) -> Any:
 def _save_to_csv_append(file_path: Path, fieldnames: list[str], data: dict[str, Any]) -> None:
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_exists = file_path.exists()
-    row = {k: _csv_cell_excel_text(v) if (isinstance(v, str) or v is None) else v for k, v in data.items()}
+    row = {
+        k: _csv_cell_excel_text(v) if (isinstance(v, str) or v is None) else v
+        for k, v in data.items()
+    }
     with open(file_path, "a", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         if not file_exists:
@@ -458,9 +431,20 @@ def _read_csv_rows(csv_path: Path) -> list[dict[str, Any]]:
         return [dict(r) for r in csv.DictReader(f)]
 
 
+def _norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
 def _safe_text(locator) -> str:
     try:
-        return re.sub(r"\s+", " ", (locator.first.inner_text() or "")).strip()
+        return _norm_space(locator.first.inner_text() or "")
+    except Exception:
+        return ""
+
+
+def _safe_attr(locator, name: str) -> str:
+    try:
+        return (locator.first.get_attribute(name) or "").strip()
     except Exception:
         return ""
 
@@ -470,7 +454,7 @@ def _download_image(page, image_url: str, save_path: Path) -> bool:
         return False
     try:
         headers = {
-            "Referer": (page.url or "https://certified.hyundai.com/").split("#")[0],
+            "Referer": (page.url or "https://autoinside.co.kr/").split("#")[0],
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -490,11 +474,50 @@ def _download_image(page, image_url: str, save_path: Path) -> bool:
         return False
 
 
+def _to_abs_url(page_url: str, src: str) -> str:
+    raw = (src or "").strip()
+    if not raw or raw.startswith("data:"):
+        return ""
+    if raw.startswith("//"):
+        return "https:" + raw
+    if raw.startswith("http"):
+        return raw
+    return urljoin(page_url, raw)
+
+
+def _collect_autoinside_gallery_urls(page, root) -> list[str]:
+    page_url = page.url or "https://autoinside.co.kr/"
+    seen: set[str] = set()
+    urls: list[str] = []
+
+    selectors = [
+        _AUTOINSIDE_MAIN_GALLERY_IMG_SEL,
+        _AUTOINSIDE_MAIN_GALLERY_IMG_SEL_LOOSE,
+        ".swiper-wrapper .swiper-slide img",
+        ".car_view_content img",
+    ]
+    for sel in selectors:
+        try:
+            imgs = root.locator(sel)
+            if imgs.count() == 0:
+                imgs = page.locator(sel)
+            if imgs.count() == 0:
+                continue
+            for i in range(imgs.count()):
+                it = imgs.nth(i)
+                src = _safe_attr(it, "data-src") or _safe_attr(it, "src")
+                u = _to_abs_url(page_url, src)
+                if u and u not in seen:
+                    seen.add(u)
+                    urls.append(u)
+        except Exception:
+            pass
+        if urls:
+            break
+    return urls
+
+
 def _crawl_one(page, idx: int, product_id: str, detail_url: str, detail_img_dir: Path) -> dict[str, Any] | None:
-    """
-    현대차 단일 상세페이지 크롤링(재수집용).
-    - 원본 DAG 로직의 핵심 필드만 유지하며, 실패 시 None 반환.
-    """
     d_pnttm, c_dt = _get_now_times()
     data: dict[str, Any] = {f: "" for f in DETAIL_CSV_FIELDS}
     data["model_sn"] = idx
@@ -511,7 +534,7 @@ def _crawl_one(page, idx: int, product_id: str, detail_url: str, detail_img_dir:
                     detail_url,
                     wait_until="commit",
                     timeout_ms=90_000,
-                    ready_selectors=("#CPOwrap,#CPOcontents,body",),
+                    ready_selectors=(".page.car_view_wrap,body",),
                     ready_timeout_ms=20_000,
                 ),
                 logger=logging.getLogger(__name__),
@@ -527,84 +550,112 @@ def _crawl_one(page, idx: int, product_id: str, detail_url: str, detail_img_dir:
                 logging.error("재수집 접속 실패: %s - %s", product_id, e)
                 return None
 
+    root = page.locator(_AUTOINSIDE_DETAIL_ROOT_SEL).first
+    if root.count() == 0:
+        root = page.locator(_AUTOINSIDE_DETAIL_ROOT_SEL_CARVIEW).first
+    if root.count() == 0:
+        root = page.locator(_AUTOINSIDE_DETAIL_ROOT_FALLBACK).first
+    if root.count() == 0:
+        root = page.locator(".page.car_view_wrap").first
+
     try:
-        root = page.locator("#CPOwrap #CPOcontents .car_detail_cont").first
-        if root.count() == 0:
-            root = page.locator("#CPOwrap #CPOcontents").first
-        if root.count() == 0:
-            root = page.locator("#CPOwrap").first
-        if root.count() == 0:
-            root = page.locator("body").first
+        side = root.locator(".car_view_side .car_view_side_inn").first
+        price_wrap = side.locator(".car_view_price_wrap").first
 
-        # 차량명
-        if root.count() > 0:
-            try:
-                name = _safe_text(page.locator(".car_top_tit, .detail_top_tit, h1").first)
-                if name:
-                    data["car_name"] = name
-            except Exception:
-                pass
+        data["car_name"] = _safe_text(price_wrap.locator(".car_nm.carName"))
 
-        # ── 기본 정보 (pdp03_tabs first) : tit/txt 기반 매핑 ────────────────
+        spec_spans = price_wrap.locator(".car_spec span")
         try:
-            tabs_first = root.locator(".pdp03_tabs.first").first
-            base_lis = tabs_first.locator(".cont_box2 .inner .base_01 > li")
-            title_to_col = {
-                "최초등록": "initial_registration",
-                "주행거리": "mileage",
-                "연료": "car_fuel",
-                "배기량": "engine",
-                "외관컬러": "car_ext_color",
-                "내장컬러": "car_int_color",
-                "차종": "car_type",
-                "승차인원": "car_seat",
-                "구동방식": "drive_sys",
-                "차량번호": "car_num",
-                "연식": "model_year",
-                "변속기": "transmission",
-            }
-            for i in range(base_lis.count()):
-                li = base_lis.nth(i)
-                tit = _safe_text(li.locator(".tit"))
-                txt = _safe_text(li.locator(".txt"))
-                if not tit:
+            if spec_spans.count() >= 1:
+                data["year"] = _norm_space(spec_spans.nth(0).inner_text() or "")
+            if spec_spans.count() >= 2:
+                data["km"] = _norm_space(spec_spans.nth(1).inner_text() or "")
+            if spec_spans.count() >= 3:
+                data["car_spec"] = _norm_space(spec_spans.nth(2).inner_text() or "")
+            if spec_spans.count() >= 4:
+                data["car_num"] = _norm_space(spec_spans.nth(3).inner_text() or "")
+            if spec_spans.count() >= 5:
+                data["car_color"] = _norm_space(spec_spans.nth(4).inner_text() or "")
+        except Exception:
+            pass
+
+        etc_lis = side.locator(".car_info_etc li")
+        try:
+            if etc_lis.count() >= 1:
+                data["category"] = _safe_text(etc_lis.nth(0).locator(".etc_box.link_tooltip .txt.main"))
+            if etc_lis.count() >= 2:
+                data["inspection"] = _safe_text(etc_lis.nth(1).locator(".etc_box.link_tooltip .txt"))
+            if etc_lis.count() >= 3:
+                data["insurance"] = _safe_text(etc_lis.nth(2).locator(".etc_box.link_tooltip .txt"))
+        except Exception:
+            pass
+
+        # 옵션: data-nm join (여러 섹션 포함)
+        try:
+            opt_sections = root.locator(".car_view_content .section.car_opt")
+            seen: set[str] = set()
+            opt_parts: list[str] = []
+            for si in range(opt_sections.count()):
+                sec = opt_sections.nth(si)
+                nm_nodes = sec.locator(".list a.item[data-nm]")
+                if nm_nodes.count() == 0:
+                    nm_nodes = sec.locator(".list [data-nm]")
+                for ni in range(nm_nodes.count()):
+                    nm = (nm_nodes.nth(ni).get_attribute("data-nm") or "").strip()
+                    nm = _norm_space(nm)
+                    if not nm or nm in seen:
+                        continue
+                    seen.add(nm)
+                    opt_parts.append(nm)
+            data["car_opt"] = " | ".join(opt_parts)
+        except Exception:
+            data["car_opt"] = ""
+
+        # 히스토리
+        hist_section = root.locator(".car_view_content .section.car_history").first
+        hist_items = hist_section.locator(".list li.item")
+        try:
+            parts: list[str] = []
+            for i in range(hist_items.count()):
+                it = hist_items.nth(i)
+                tit = _safe_text(it.locator(".tit"))
+                txt = _safe_text(it.locator(".txt"))
+                if tit and txt:
+                    parts.append(f"{tit} : {txt}")
+                elif tit:
+                    parts.append(tit)
+                elif txt:
+                    parts.append(txt)
+            data["car_history"] = " | ".join(parts)
+        except Exception:
+            data["car_history"] = ""
+
+        # 성능점검
+        insp_section = root.locator(".car_view_content .section.car_inspect").first
+        boxes = insp_section.locator(".inspect_wrap .inspect_box .inspect_img .txt")
+        try:
+            parts: list[str] = []
+            for i in range(boxes.count()):
+                box = boxes.nth(i)
+                spans = box.locator("span")
+                if spans.count() < 2:
                     continue
-                col = title_to_col.get(tit)
-                if col and txt:
-                    data[col] = txt
+                k = _norm_space(spans.nth(0).inner_text() or "")
+                v = _norm_space(spans.nth(1).inner_text() or "")
+                if k and v:
+                    parts.append(f"{k} : {v}")
+            data["car_inspect"] = " | ".join(parts)
         except Exception:
-            pass
+            data["car_inspect"] = ""
 
-        # 간단히 텍스트 기반으로 year/km 추출(fallback)
+        # 상세 이미지 저장(간소화: 대표 갤러리 셀렉터 기반)
         try:
-            body = page.locator("body").inner_text() or ""
-            t = re.sub(r"\s+", " ", body)
-            if not data.get("year"):
-                m = re.search(r"(\d{4})\s*년", t)
-                if m:
-                    data["year"] = m.group(1) + "년"
-            if not data.get("km"):
-                m = re.search(r"(\d[\d,]*)\s*km", t, re.IGNORECASE)
-                if m:
-                    data["km"] = m.group(1) + "km"
-        except Exception:
-            pass
-
-        # 이미지(있으면)
-        try:
-            imgs = page.locator("img")
-            saved = 0
-            for i in range(min(imgs.count(), 20)):
-                src = (imgs.nth(i).get_attribute("data-src") or imgs.nth(i).get_attribute("src") or "").strip()
-                if not src or src.startswith("data:"):
-                    continue
-                out = detail_img_dir / f"{product_id}_{saved+1}.png"
-                if _download_image(page, src, out):
-                    saved += 1
-                if saved >= 5:
-                    break
-        except Exception:
-            pass
+            gallery_urls = _collect_autoinside_gallery_urls(page, root)
+            for j, src in enumerate(gallery_urls, start=1):
+                out = detail_img_dir / f"{product_id}_{j}.png"
+                _download_image(page, src, out)
+        except Exception as e:
+            logging.debug("[갤러리 이미지] %s : %s", product_id, e)
 
     except Exception as e:
         logging.error("재수집 파싱 전체 오류: %s - %s", product_id, e)
