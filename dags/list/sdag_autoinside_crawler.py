@@ -11,6 +11,7 @@ Airflow DAG:
 import csv
 import logging
 import os
+import re
 import shutil
 import sys
 from datetime import datetime
@@ -932,8 +933,9 @@ except Exception:
 # True: Chrome 창 띄워서 브랜드 클릭 수집 (제조사 전환 시 목록 갱신 안정). False: headless.
 # 창 안 띄우려면 실행 전에 AUTOINSIDE_HEADED=0 설정.
 USE_HEADED_FOR_BRAND = os.environ.get("AUTOINSIDE_HEADED", "1").strip().lower() in ("1", "true", "yes")
-# 1/true/yes: 브랜드 목록을 AJAX API(display_bu_used_car_list_ajax.do)로 수집. 0: Playwright 클릭 방식.
-USE_AJAX_FOR_BRAND = os.environ.get("AUTOINSIDE_USE_AJAX", "0").strip().lower() in ("1", "true", "yes")
+# 1/true/yes(기본): 브랜드 목록을 AJAX 트리 API(display_bu_used_car_list_ajax.do)로 수집(누락 없는 완전 수집).
+# 0: Playwright 클릭 방식(좌측 트리 클릭 기반, 일부 차종 누락 가능).
+USE_AJAX_FOR_BRAND = os.environ.get("AUTOINSIDE_USE_AJAX", "1").strip().lower() in ("1", "true", "yes")
 HEADLESS_MODE = True
 
 URL = "https://www.autoinside.co.kr/display/bu/display_bu_used_car_list.do"
@@ -1135,16 +1137,14 @@ def _normalize_text(text):
 
 def run_autoinside_brand_list_via_ajax(result_dir: Path, logger, csv_path: Path | None = None):
     """
-    오토인사이드 display_bu_used_car_list_ajax.do API로 차량 목록을 페이지네이션하여
-    수집한 뒤, 제조사·차종·모델 조합을 추출하여 autoinside_brand_list.csv 로 저장.
-    (Playwright 클릭 방식 대신 사용 시 차종 목록 미갱신/클릭 가림 문제 회피)
+    오토인사이드 display_bu_used_car_list_ajax.do 트리 API로 제조사→차종→모델을 누락 없이 수집.
 
-    JSON 구조와 컬럼 매핑:
-    - object.mnfc_list[]: 제조사 목록. v_flag_diff "N"→국산, "Y"→수입(category_cmn), xc_mkco_nm→제조사(brand_list).
-      단, 하위(차종/모델)는 mnfc_list에 없음.
-    - object.list[]: 실제 차량 광고 목록. 여기서 제조사·차종·모델 계층을 채움.
-      각 항목: xc_mkco_nm=제조사(brand_list), xc_vcl_brnd_nm=차종(car_list), xc_vcmd_nm=모델(model_list).
-      i_sFlagDiff=N/Y 요청으로 국산/수입을 나누어 호출하므로 category_cmn은 요청 기준으로 "국산"/"수입".
+    i_sCtgrCd 규칙:
+    - 미지정 → object.mnfc_list[]에 제조사 전체. v_flag_diff "N"=국산, "Y"=수입, v_mnfccd=제조사코드, xc_mkco_nm=제조사명.
+    - "MKCOxxxx" → 해당 제조사의 brnd_list[] 포함. v_brandcd=차종코드, xc_vcl_brnd_nm=차종명.
+    - "MKCOxxxx,BRNDxxxx" → 해당 차종의 model_list[] 포함. xc_vcmd_nm=모델명, v_modelnm_detail="(20~23)" 연식.
+
+    list[] 페이지네이션 기반 구방식은 매물 없는 차종/모델을 누락하므로 사용하지 않음.
     """
     result_dir.mkdir(parents=True, exist_ok=True)
     csv_path = csv_path if csv_path is not None else (result_dir / "autoinside_brand_list.csv")
@@ -1155,81 +1155,133 @@ def run_autoinside_brand_list_via_ajax(result_dir: Path, logger, csv_path: Path 
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": URL + "/",
+        "Referer": URL,
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "X-Requested-With": "XMLHttpRequest",
     })
 
-    # (category_cmn, brand_list, car_list, model_list) 중복 제거용
-    seen = set()
-    rows = []
-
-    for category_flag, category_cmn in [("N", "국산"), ("Y", "수입")]:
-        page_no = 1
-        page_size = 100
-        logger.info("[%s] AJAX 목록 수집 시작", category_cmn)
-        while True:
+    def _post_tree(ctgr_cd: str) -> dict:
+        data = {"i_iNowPageNo": 1, "i_iPageSize": 1}
+        if ctgr_cd:
+            data["i_sCtgrCd"] = ctgr_cd
+        last_err: Exception | None = None
+        for attempt in range(1, 4):
             try:
-                data = {
-                    "i_sFlagDiff": category_flag,
-                    "i_iNowPageNo": page_no,
-                    "i_iPageSize": page_size,
-                }
                 resp = session.post(URL_AJAX, data=data, timeout=30)
                 resp.raise_for_status()
                 body = resp.json()
-            except requests.RequestException as e:
-                logger.warning("[%s] AJAX 요청 실패 (page=%s): %s", category_cmn, page_no, e)
-                break
-            except ValueError as e:
-                logger.warning("[%s] AJAX JSON 파싱 실패 (page=%s): %s", category_cmn, page_no, e)
-                break
+                if body.get("status") != "succ":
+                    raise RuntimeError(f"status != succ: {body.get('status')}")
+                return body.get("object") or {}
+            except (requests.RequestException, ValueError, RuntimeError) as e:
+                last_err = e
+                if attempt < 3:
+                    import time
+                    time.sleep(0.5 * attempt)
+        raise RuntimeError(f"AJAX 요청 실패(i_sCtgrCd={ctgr_cd!r}): {last_err}")
 
-            if body.get("status") != "succ":
-                logger.warning("[%s] AJAX status != succ: %s", category_cmn, body.get("status"))
-                break
+    def _find_mnfc(obj: dict, mnfc_cd: str) -> dict | None:
+        for m in (obj.get("mnfc_list") or []):
+            if (m.get("v_mnfccd") or "").strip() == mnfc_cd:
+                return m
+        return None
 
-            obj = body.get("object") or {}
-            # 차종(car_list)·모델(model_list)은 list[]에만 있음. mnfc_list는 제조사+국산/수입만 제공.
-            lst = obj.get("list") or []
-            total_pages = int(obj.get("i_iTotalPageCnt") or 0)
-            if page_no == 1 and total_pages:
-                total = int(obj.get("i_iRecordCnt") or 0)
-                logger.info("[%s] 총 %d건, %d페이지", category_cmn, total, total_pages)
+    def _find_brnd(mnfc_node: dict, brnd_cd: str) -> dict | None:
+        for b in (mnfc_node.get("brnd_list") or []):
+            if (b.get("v_brandcd") or "").strip() == brnd_cd:
+                return b
+        return None
 
-            for item in lst:
-                # list 항목: xc_mkco_nm=제조사, xc_vcl_brnd_nm=차종, xc_vcmd_nm=모델
-                mkco = (item.get("xc_mkco_nm") or "").strip()
-                brnd = (item.get("xc_vcl_brnd_nm") or "").strip()
-                model = (item.get("xc_vcmd_nm") or "").strip()
-                if not mkco and not brnd and not model:
-                    continue
-                key = (category_cmn, mkco, brnd, model)
-                if key in seen:
-                    continue
-                seen.add(key)
-                now = datetime.now()
-                rows.append({
-                    "model_sn": len(rows) + 1,
-                    "category_cmn": category_cmn,
-                    "brand_list": mkco or "-",
-                    "car_list": brnd or "-",
-                    "model_list": model or brnd or "-",
-                    "production_period": "",
-                    "date_crtr_pnttm": now.strftime("%Y%m%d"),
-                    "create_dt": now.strftime("%Y%m%d%H%M"),
-                })
+    def _parse_period(detail: str) -> str:
+        s = (detail or "").strip()
+        if not s:
+            return ""
+        m = re.match(r"^\((.*)\)$", s)
+        return (m.group(1).strip() if m else s)
 
-            if not lst or page_no >= total_pages:
-                break
-            page_no += 1
+    flag_to_cmn = {"N": "국산", "Y": "수입"}
+    rows: list[dict] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    def _append(category_cmn: str, brand: str, car: str, model: str, period: str) -> None:
+        key = (category_cmn, brand, car, model)
+        if key in seen:
+            return
+        seen.add(key)
+        now = datetime.now()
+        rows.append({
+            "model_sn": len(rows) + 1,
+            "category_cmn": category_cmn,
+            "brand_list": brand or "-",
+            "car_list": car or brand or "-",
+            "model_list": model or car or brand or "-",
+            "production_period": period,
+            "date_crtr_pnttm": now.strftime("%Y%m%d"),
+            "create_dt": now.strftime("%Y%m%d%H%M"),
+        })
+
+    root = _post_tree("")
+    mnfc_items = root.get("mnfc_list") or []
+    logger.info("제조사 총 %d개 조회", len(mnfc_items))
+
+    failures: list[str] = []
+    for mnfc in mnfc_items:
+        mnfc_cd = (mnfc.get("v_mnfccd") or "").strip()
+        mnfc_nm = (mnfc.get("xc_mkco_nm") or "").strip()
+        flag = (mnfc.get("v_flag_diff") or "").strip().upper()
+        category_cmn = flag_to_cmn.get(flag) or ""
+        if not mnfc_cd or not mnfc_nm or not category_cmn:
+            logger.warning("제조사 정보 누락 skip: %s", mnfc)
+            continue
+
+        try:
+            mnfc_obj = _post_tree(mnfc_cd)
+        except Exception as e:
+            msg = f"[{category_cmn}] {mnfc_nm} brnd_list 조회 실패: {e}"
+            logger.error(msg)
+            failures.append(msg)
+            continue
+        mnfc_node = _find_mnfc(mnfc_obj, mnfc_cd) or {}
+        brnd_items = mnfc_node.get("brnd_list") or []
+        logger.info("[%s] %s 차종 %d개", category_cmn, mnfc_nm, len(brnd_items))
+
+        if not brnd_items:
+            _append(category_cmn, mnfc_nm, mnfc_nm, mnfc_nm, "")
+            continue
+
+        for brnd in brnd_items:
+            brnd_cd = (brnd.get("v_brandcd") or "").strip()
+            brnd_nm = (brnd.get("xc_vcl_brnd_nm") or "").strip() or mnfc_nm
+            if not brnd_cd:
+                _append(category_cmn, mnfc_nm, brnd_nm, brnd_nm, "")
+                continue
+
+            try:
+                brnd_obj = _post_tree(f"{mnfc_cd},{brnd_cd}")
+            except Exception as e:
+                msg = f"[{category_cmn}] {mnfc_nm}/{brnd_nm} model_list 조회 실패: {e}"
+                logger.warning(msg)
+                _append(category_cmn, mnfc_nm, brnd_nm, brnd_nm, "")
+                continue
+            brnd_node = _find_brnd(_find_mnfc(brnd_obj, mnfc_cd) or {}, brnd_cd) or {}
+            model_items = brnd_node.get("model_list") or []
+            if not model_items:
+                _append(category_cmn, mnfc_nm, brnd_nm, brnd_nm, "")
+                continue
+            for model in model_items:
+                model_nm = (model.get("xc_vcmd_nm") or "").strip() or brnd_nm
+                period = _parse_period(model.get("v_modelnm_detail") or "")
+                _append(category_cmn, mnfc_nm, brnd_nm, model_nm, period)
 
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=headers_csv)
         w.writeheader()
         w.writerows(rows)
-    logger.info("저장 완료 (AJAX): %s (총 %d건)", csv_path, len(rows))
+    logger.info("저장 완료 (AJAX 트리): %s (총 %d건)", csv_path, len(rows))
+
+    if failures:
+        raise RuntimeError("브랜드 목록 수집 실패(일부 제조사 누락): " + " | ".join(failures))
 
 
 def _autoinside_click_flag_diff(page, radio_for: str, logger, category_cmn: str) -> bool:

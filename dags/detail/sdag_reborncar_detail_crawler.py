@@ -614,7 +614,11 @@ def _norm_space(s: str) -> str:
 
 def _safe_text(locator) -> str:
     try:
-        return _norm_space(locator.first.inner_text() or "")
+        t = _norm_space(locator.first.inner_text() or "")
+        if t:
+            return t
+        # display:none 상태의 자손은 inner_text가 빈 문자열이라 textContent로 폴백
+        return _norm_space(locator.first.text_content() or "")
     except Exception:
         return ""
 
@@ -742,6 +746,9 @@ def _crawl_one(
     data["date_crtr_pnttm"] = d_pnttm
     data["create_dt"] = c_dt
 
+    # 본문(.vip-head-info)이 파싱 가능한 상태가 될 때까지 대기.
+    # 이전 ready_selectors는 body까지 OR 매칭이라 commit 직후 즉시 통과하던 버그.
+    loaded = False
     for attempt in range(3):
         try:
             goto_with_retry(
@@ -750,22 +757,43 @@ def _crawl_one(
                     detail_url,
                     wait_until="commit",
                     timeout_ms=90_000,
-                    ready_selectors=("#wrap .vip-section,.vip-section,body",),
+                    ready_selectors=(".vip-section .vip-head .vip-head-info",),
                     ready_timeout_ms=20_000,
                 ),
                 logger=logging.getLogger(__name__),
                 attempts=1,
             )
-            # 고정 1.8초 대신 짧게만 대기(대부분 selector 로드로 충분)
             page.wait_for_timeout(300)
+            loaded = True
             break
         except Exception as e:
             if attempt < 2:
                 logging.warning("재시도 (%d/3): %s - %s", attempt + 2, product_id, e)
                 time.sleep(2)
             else:
-                logging.error("접속 실패: %s - %s", product_id, e)
+                logging.error("접속/본문 로드 실패: %s - %s", product_id, e)
                 return None
+    if not loaded:
+        return None
+
+    # AQI 섹션은 /api/v1/car/getCarAqiInfo.rb AJAX로 지연 렌더링됨.
+    # - aqi-list(.vip-aqi-group .aqi-list)는 거의 모든 차량에 존재하므로 AJAX 완료 시그널로 사용.
+    # - vip-aqi-notice-form은 `display:none`으로 시작해 노티스 있을 때만 .show()되므로 :visible 대기.
+    try:
+        page.wait_for_selector(
+            "#aqi .vip-aqi-group .aqi-list, .con-section.aqi .vip-aqi-group .aqi-list",
+            timeout=10_000,
+        )
+    except Exception:
+        pass
+    try:
+        page.wait_for_selector(
+            "#aqi .vip-aqi-notice-form:visible, .con-section.aqi .vip-aqi-notice-form:visible",
+            timeout=3_000,
+        )
+    except Exception:
+        # 노티스가 없는 차량은 form이 끝까지 hidden — 정상 케이스.
+        pass
 
     root = page.locator("#wrap .vip-section").first
     if root.count() == 0:

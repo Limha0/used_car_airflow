@@ -709,6 +709,78 @@ def _format_installment(text: str) -> str:
     return t.strip()
 
 
+def _fetch_warranty_fragment(page, product_id: str) -> list[dict[str, str]]:
+    """
+    GET /p/goods/{goodsNo}/warranty-data 로 보증 HTML fragment를 받아
+    [{remain_period, until_period, remain_distance, until_distance}] 리스트로 반환.
+    - `.warranty-container`는 상태에 따라 `set_able` 클래스 유무가 달라 페이지 DOM만으로는 누락됨.
+    - fragment는 .set_able 여부와 관계없이 항상 `.list > li`를 포함.
+    """
+    if not product_id:
+        return []
+    url = f"https://certified.hyundai.com/p/goods/{product_id}/warranty-data"
+    try:
+        resp = page.request.get(
+            url,
+            timeout=20_000,
+            headers={
+                "Referer": page.url or "https://certified.hyundai.com/",
+                "X-Requested-With": "XMLHttpRequest",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                ),
+            },
+        )
+        if not resp or not resp.ok:
+            return []
+        html = resp.text() or ""
+    except Exception:
+        return []
+
+    # 아주 가벼운 파싱: .list > li 블록마다 .period 두 개, .distance 두 개를 순서대로 추출.
+    items: list[dict[str, str]] = []
+    for li_html in re.findall(
+        r'<ul[^>]*class="[^"]*\blist\b[^"]*"[^>]*>(.*?)</ul>',
+        html, flags=re.DOTALL,
+    ):
+        for li in re.findall(r"<li\b[^>]*>(.*?)</li>", li_html, flags=re.DOTALL):
+            periods = re.findall(
+                r'<[a-z]+[^>]*class="[^"]*\bperiod\b[^"]*"[^>]*>(.*?)</[a-z]+>',
+                li, flags=re.DOTALL | re.IGNORECASE,
+            )
+            distances = re.findall(
+                r'<[a-z]+[^>]*class="[^"]*\bdistance\b[^"]*"[^>]*>(.*?)</[a-z]+>',
+                li, flags=re.DOTALL | re.IGNORECASE,
+            )
+            def _clean(s: str) -> str:
+                s = re.sub(r"<[^>]+>", " ", s or "")
+                return _norm_space(s)
+            items.append({
+                "remain_period":   _clean(periods[0]) if len(periods) >= 1 else "",
+                "until_period":    _clean(periods[1]) if len(periods) >= 2 else "",
+                "remain_distance": _clean(distances[0]) if len(distances) >= 1 else "",
+                "until_distance":  _clean(distances[1]) if len(distances) >= 2 else "",
+            })
+    return items
+
+
+def _compose_guarantee_from_fragment(item: dict[str, str]) -> str:
+    part1 = ""
+    if item.get("remain_period") and item.get("until_period"):
+        part1 = f"{item['remain_period']} ({item['until_period']})"
+    else:
+        part1 = item.get("remain_period") or item.get("until_period") or ""
+    part2 = ""
+    if item.get("remain_distance") and item.get("until_distance"):
+        part2 = f"{item['remain_distance']} ({item['until_distance']})"
+    else:
+        part2 = item.get("remain_distance") or item.get("until_distance") or ""
+    if part1 and part2:
+        return f"{part1} | {part2}"
+    return part1 or part2
+
+
 def _compose_guarantee(li_locator) -> str:
     """
     보증 li 하나를:
@@ -860,6 +932,9 @@ def _crawl_one(
     data["date_crtr_pnttm"] = d_pnttm
     data["create_dt"] = c_dt
 
+    # 본문(.car_detail_box1)이 파싱될 때까지 기다려야 base_01 등 SSR 요소가 누락 없이 읽힘.
+    # 이전 셀렉터는 body까지 OR 매칭이라 commit 직후 즉시 통과하던 버그.
+    loaded = False
     for attempt in range(3):
         try:
             goto_with_retry(
@@ -868,21 +943,34 @@ def _crawl_one(
                     detail_url,
                     wait_until="commit",
                     timeout_ms=90_000,
-                    ready_selectors=("#CPOwrap,#CPOcontents,body",),
+                    ready_selectors=(
+                        "#CPOwrap #CPOcontents .car_detail_cont .car_detail_box1",
+                    ),
                     ready_timeout_ms=30_000,
                 ),
                 logger=logging.getLogger(__name__),
                 attempts=1,
             )
-            page.wait_for_timeout(800)
+            # 기본 정보 li 12개가 모두 DOM에 붙을 때까지 추가 대기 (SSR이라 금방 끝남)
+            try:
+                page.wait_for_function(
+                    "document.querySelectorAll('.pdp03_tabs.first .cont_box2 .inner .base_01 > li').length >= 6",
+                    timeout=10_000,
+                )
+            except Exception:
+                pass
+            page.wait_for_timeout(400)
+            loaded = True
             break
         except Exception as e:
             if attempt < 2:
                 logging.warning("재시도 (%d/3): %s - %s", attempt + 2, product_id, e)
                 time.sleep(2)
             else:
-                logging.error("접속 실패: %s - %s", product_id, e)
+                logging.error("접속/본문 로드 실패: %s - %s", product_id, e)
                 return None
+    if not loaded:
+        return None
 
     root = page.locator("#CPOwrap #CPOcontents .car_detail_cont").first
     if root.count() == 0:
@@ -922,8 +1010,9 @@ def _crawl_one(
         data["inspection"] = _safe_text(
             chart.locator("#progress_compare .text_box .text")
         )
+        # 사고이력: 상태에 따라 .text_box.img01/img02/img03 등 클래스가 달라지므로 .img* 고정 매칭 대신 widen
         data["accident_history"] = _safe_text(
-            chart.locator("#progress_history .text_box.img02 .text")
+            chart.locator("#progress_history .text_box .text")
         )
 
         # ── 기본 정보 (pdp03_tabs first) ──────────────────────────────────
@@ -980,14 +1069,21 @@ def _crawl_one(
         )
 
         # ── 보증 잔여 (warranty-remain-container) ─────────────────────────
-        warranty_root = page.locator("#warranty-remain-container").first
-        warranty_list = warranty_root.locator(
-            ".pdp03_tabs.first.warranty-section.type02 .warranty-container.set_able .list > li"
-        )
-        if warranty_list.count() >= 1:
-            data["guarantee_1"] = _compose_guarantee(warranty_list.nth(0))
-        if warranty_list.count() >= 2:
-            data["guarantee_2"] = _compose_guarantee(warranty_list.nth(1))
+        # 1차: AJAX fragment(`/p/goods/{goodsNo}/warranty-data`) 직호출 — set_able 여부 무관하게 안정 수집.
+        # 2차 폴백: 페이지 DOM (.set_able 요구하지 않도록 셀렉터 완화).
+        warranty_items = _fetch_warranty_fragment(page, product_id)
+        if warranty_items:
+            if len(warranty_items) >= 1:
+                data["guarantee_1"] = _compose_guarantee_from_fragment(warranty_items[0])
+            if len(warranty_items) >= 2:
+                data["guarantee_2"] = _compose_guarantee_from_fragment(warranty_items[1])
+        else:
+            warranty_root = page.locator("#warranty-remain-container").first
+            warranty_list = warranty_root.locator(".warranty-container .list > li")
+            if warranty_list.count() >= 1:
+                data["guarantee_1"] = _compose_guarantee(warranty_list.nth(0))
+            if warranty_list.count() >= 2:
+                data["guarantee_2"] = _compose_guarantee(warranty_list.nth(1))
 
         # ── 옵션 (off 없는 li의 span) ─────────────────────────────────────
         opt_root = root.locator(".pdp03_tabs.option .cont_box.option .option_01").first
@@ -1014,8 +1110,21 @@ def _crawl_one(
         logging.error("파싱 전체 오류: %s - %s", product_id, e)
         return None
 
+    # 최종 검증: SSR 섹션이 통째로 누락된 케이스(초기 row 6 증상)를 실패 처리.
     core_cols = ("car_name", "year", "km", "car_pay")
     if sum(1 for c in core_cols if str(data.get(c) or "").strip()) == 0:
+        return None
+    # 기본정보(base_01) 섹션 전체가 비어있으면 재시도 대상으로 넘김 (부분 저장 방지).
+    base_cols = (
+        "initial_registration", "mileage", "car_fuel", "engine",
+        "car_ext_color", "car_int_color", "car_type", "car_seat",
+        "drive_sys", "car_num", "model_year", "transmission",
+    )
+    if sum(1 for c in base_cols if str(data.get(c) or "").strip()) == 0:
+        logging.warning(
+            "[상세수집실패] product_id=%s: 기본정보(base_01) 섹션 전체 누락 → 재시도 대상",
+            product_id,
+        )
         return None
 
     return data

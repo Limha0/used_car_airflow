@@ -732,9 +732,9 @@ def _apply_text_fallback(page, data: dict[str, Any]) -> None:
         body_text = ""
     body_text = re.sub(r"[ \t]+", " ", body_text or "")
 
-    # car_name fallback
+    # car_name fallback — <title>은 SPA 미하이드레이션 시 placeholder("[번호판]시세")를 긁어오므로 제외.
     if not str(data.get("car_name") or "").strip():
-        for sel in (".css-1ugrlhy", "h1", "title"):
+        for sel in (".css-1ugrlhy", "h1"):
             try:
                 t = page.locator(sel).first.inner_text().strip()
                 if t:
@@ -974,6 +974,15 @@ def _parse_inspection(record_items_locator, label_text: str) -> str:
     return ""
 
 
+def _parse_inspection_first(record_items_locator, *label_texts: str) -> str:
+    """record_items 에서 label_texts 순서대로 매칭해, 첫 비어 있지 않은 상세 문자열을 반환."""
+    for lt in label_texts:
+        out = _parse_inspection(record_items_locator, lt)
+        if out:
+            return out
+    return ""
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  단일 상세페이지 크롤링
 # ═══════════════════════════════════════════════════════════════════
@@ -994,7 +1003,9 @@ def _crawl_one(
     data["date_crtr_pnttm"] = d_pnttm
     data["create_dt"]       = c_dt
 
-    # 페이지 로드 (최대 3회 재시도)
+    # 페이지 로드 (최대 3회 재시도). 헤이딜러는 Vite SPA라 .css-ltrevz(섹션)이 붙을 때까지 기다려야
+    # <title>(placeholder) 상태에서 파싱되는 사고를 막을 수 있음.
+    loaded = False
     for attempt in range(3):
         try:
             goto_with_retry(
@@ -1003,21 +1014,32 @@ def _crawl_one(
                     detail_url,
                     wait_until="commit",
                     timeout_ms=90_000,
-                    ready_selectors=(".css-1uus6sd,.css-12qft46,body",),
-                    ready_timeout_ms=20_000,
+                    ready_selectors=(".css-1uus6sd .css-12qft46 .css-ltrevz",),
+                    ready_timeout_ms=25_000,
                 ),
                 logger=logging.getLogger(__name__),
                 attempts=1,
             )
+            # 섹션 4개 이상 렌더링 대기 (연식·사고·타이어 등 주요 섹션 보장)
+            try:
+                page.wait_for_function(
+                    "document.querySelectorAll('.css-1uus6sd .css-12qft46 .css-ltrevz').length >= 4",
+                    timeout=10_000,
+                )
+            except Exception:
+                pass
             page.wait_for_timeout(250)
+            loaded = True
             break
         except Exception as e:
             if attempt < 2:
                 logging.warning("재시도 (%d/3): %s - %s", attempt + 2, product_id, e)
                 time.sleep(2)
             else:
-                logging.error("접속 실패: %s - %s", product_id, e)
+                logging.error("접속/하이드레이션 실패: %s - %s", product_id, e)
                 return None
+    if not loaded:
+        return None
 
     try:
         # 본문 영역(.css-1uus6sd .css-12qft46) 안의 ltrevz만 쓰면 nth(0~4)가 페이지 전역
@@ -1170,7 +1192,11 @@ def _crawl_one(
                 ".css-5pr39e .css-7y52wh .css-1b6pogx "
                 ".css-154rxsx .css-dkq6n3 .css-1p1dktr"
             )
-            data["inspection_records_1"] = _parse_inspection(record_items, "단순교환 무사고")
+            data["inspection_records_1"] = _parse_inspection_first(
+                record_items,
+                "단순교환 무사고",
+                "완전무사고",
+            )
             data["inspection_records_2"] = _parse_inspection(record_items, "하부 정상")
         except Exception as e:
             logging.debug("[섹션5] %s : %s", product_id, e)
@@ -1201,5 +1227,21 @@ def _crawl_one(
         _apply_text_fallback(page, data)
 
     _apply_detail_extras_fallback(page, data)
+
+    # 최종 검증: SPA 미하이드레이션 placeholder 또는 핵심 필드 미추출 → 실패 처리하여 빈 행 저장 방지
+    car_name_final = str(data.get("car_name") or "").strip()
+    if "[번호판]" in car_name_final or car_name_final.startswith("헤이딜러 – 인증중고차"):
+        logging.warning(
+            "[상세수집실패] product_id=%s: SPA 미하이드레이션 (car_name=%r)",
+            product_id, car_name_final,
+        )
+        return None
+    filled_core_final = sum(1 for c in core_cols if str(data.get(c) or "").strip())
+    if filled_core_final <= 1:
+        logging.warning(
+            "[상세수집실패] product_id=%s: 핵심 필드 미추출 (filled_core=%d, car_name=%r)",
+            product_id, filled_core_final, car_name_final,
+        )
+        return None
 
     return data
