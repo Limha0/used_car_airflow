@@ -11,11 +11,15 @@ Airflow DAG:
 - list는 임시 테이블 적재 후 원천 테이블과 동기화
 - 정상 완료 후 sdag_kcar_detail_crawl 트리거
 """
+import base64
 import csv
+import json
 import logging
 import os
 import re
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -327,6 +331,28 @@ DETAIL_URL_TEMPLATE = "https://www.kcar.com/bc/detail/carInfoDtl?i_sCarCd={}"
 CAR_LIST_BOX_SELECTOR = ".resultCnt .carListWrap .carListBox"
 HEADLESS_MODE = os.environ.get("KCAR_HEADED", "0").strip().lower() not in ("1", "true", "yes")
 USE_CHROME_CHANNEL = os.environ.get("KCAR_CHROME_CHANNEL", "0").strip().lower() in ("1", "true", "yes")
+
+# kcar 공개 API (api.kcar.com)로 브랜드 트리·목록을 직접 수집. 0으로 끄면 기존 Playwright 방식 폴백.
+# - brand: 5개의 JSON 엔드포인트로 제조사/차종/모델/등급/세부등급 전체를 한 번에 덤프.
+# - list: /bc/search/list 는 AES-128-CBC 암호화(키/IV는 사이트 JS에 하드코딩). pageno/limit 로 페이지네이션.
+USE_API_FOR_KCAR = os.environ.get("KCAR_USE_API", "1").strip().lower() in ("1", "true", "yes")
+KCAR_API_BASE = "https://api.kcar.com"
+KCAR_API_TREE_PATHS = ("mnuftr", "modelGrp", "model", "grd", "grdDtl")
+KCAR_API_AES_KEY = b"SKFJ2424DasfaJRI"
+KCAR_API_AES_IV = b"sfq241sf3dscs321"
+KCAR_API_LIST_LIMIT = 100  # 서버 허용치: 100이 안정
+KCAR_API_LIST_WORKERS = 12  # 동시 페이지 요청 워커 수
+KCAR_API_IMAGE_WORKERS = 16  # 이미지 다운로드 워커 수
+KCAR_API_DEFAULT_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/plain, */*",
+    "Origin": "https://www.kcar.com",
+    "Referer": URL,
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+}
 
 YEAR_STR = ""
 DATE_STR = ""
@@ -946,6 +972,502 @@ def _reset_kcar_car_type_filters(page, logger) -> bool:
     except Exception:
         pass
     return False
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  K Car 공개 API 기반 수집 (Playwright 없이 brand/list 전체 덤프)
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _kcar_api_encrypt(payload: dict[str, Any]) -> str:
+    """AES-128-CBC / PKCS7 / base64. 키·IV는 kcar 번들(JS)에 하드코딩된 값 그대로."""
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import pad
+
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ct = AES.new(KCAR_API_AES_KEY, AES.MODE_CBC, KCAR_API_AES_IV).encrypt(pad(raw, AES.block_size))
+    return base64.b64encode(ct).decode("ascii")
+
+
+def _kcar_api_session() -> requests.Session:
+    """WMONID 쿠키를 한 번 받아 세션에 묶어두고, 기본 헤더와 연결풀 크기를 설정한다."""
+    s = requests.Session()
+    s.headers.update(KCAR_API_DEFAULT_HEADERS)
+    # 기본 HTTPAdapter의 pool_maxsize(=10)는 이미지 병렬 16 workers에 부족 → 풀 확대
+    pool_size = max(KCAR_API_LIST_WORKERS, KCAR_API_IMAGE_WORKERS) + 4
+    adapter = requests.adapters.HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    try:
+        s.get(URL, timeout=15)
+    except Exception:
+        pass
+    return s
+
+
+def _kcar_api_post(
+    session: requests.Session,
+    path: str,
+    body: dict[str, Any],
+    *,
+    timeout: int = 30,
+    retries: int = 3,
+) -> dict[str, Any]:
+    last_err: Exception | None = None
+    for attempt in range(retries):
+        try:
+            resp = session.post(f"{KCAR_API_BASE}{path}", json=body, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json() or {}
+        except (requests.RequestException, ValueError) as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+    raise RuntimeError(f"kcar API 호출 실패 {path} body={body}: {last_err}")
+
+
+def _fetch_kcar_tree_group(session: requests.Session, name: str) -> list[dict[str, Any]]:
+    """
+    /bc/search/group/{name} 전체 덤프. body={}로 전체 반환됨.
+    name: mnuftr / modelGrp / model / grd / grdDtl
+    """
+    body = _kcar_api_post(session, f"/bc/search/group/{name}", {})
+    data = body.get("data") if isinstance(body, dict) else None
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for v in data.values():
+            if isinstance(v, list):
+                return v
+    return []
+
+
+def _parse_kcar_production_period(raw: str) -> str:
+    """
+    kcar API의 `prdcnYear` 포맷 예: '(24년~현재)', '(20년~23년)'.
+    기존 CSV 포맷 '24~현재' / '20~23' 로 정규화 (괄호·년 제거).
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    m = re.match(r"^\((.*)\)$", s)
+    if m:
+        s = m.group(1).strip()
+    return s.replace("년", "").strip()
+
+
+def _kcar_api_category_cmn(car_type: str) -> str:
+    ct = (car_type or "").strip().upper()
+    if ct == "KOR":
+        return "국산"
+    if ct == "IMP":
+        return "수입"
+    return ct or "-"
+
+
+def _write_kcar_brand_csv_via_api(csv_path: Path, logger) -> int:
+    headers = [
+        "model_sn",
+        "depth_1",
+        "brand_list",
+        "car_list",
+        "model_list",
+        "model_list_1",
+        "model_list_2",
+        "production_period",
+        "date_crtr_pnttm",
+        "create_dt",
+    ]
+    if csv_path.exists():
+        csv_path.unlink()
+
+    session = _kcar_api_session()
+    logger.info("K Car brand API 수집 시작: %s", ", ".join(KCAR_API_TREE_PATHS))
+
+    # 5개 엔드포인트 병렬 덤프
+    raw: dict[str, list[dict[str, Any]]] = {}
+    with ThreadPoolExecutor(max_workers=len(KCAR_API_TREE_PATHS)) as ex:
+        fut_map = {ex.submit(_fetch_kcar_tree_group, session, name): name for name in KCAR_API_TREE_PATHS}
+        for fut in as_completed(fut_map):
+            name = fut_map[fut]
+            raw[name] = fut.result()
+            logger.info("  · %s: %d건", name, len(raw[name]))
+
+    mnuftrs = raw.get("mnuftr") or []
+    if not mnuftrs:
+        raise RuntimeError("K Car brand API: mnuftr 결과 없음")
+
+    # 자식 인덱스 구성 (부모 순서 유지를 위해 원본 순서대로 append).
+    model_grp_by_mnuftr: dict[str, list[dict[str, Any]]] = {}
+    for mg in raw.get("modelGrp") or []:
+        model_grp_by_mnuftr.setdefault(str(mg.get("mnuftrCd") or ""), []).append(mg)
+
+    model_by_grp: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for m in raw.get("model") or []:
+        key = (str(m.get("mnuftrCd") or ""), str(m.get("modelGrpCd") or ""))
+        model_by_grp.setdefault(key, []).append(m)
+
+    grd_by_model: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for g in raw.get("grd") or []:
+        key = (str(g.get("mnuftrCd") or ""), str(g.get("modelGrpCd") or ""), str(g.get("modelCd") or ""))
+        grd_by_model.setdefault(key, []).append(g)
+
+    grddtl_by_grd: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    for gd in raw.get("grdDtl") or []:
+        key = (
+            str(gd.get("mnuftrCd") or ""),
+            str(gd.get("modelGrpCd") or ""),
+            str(gd.get("modelCd") or ""),
+            str(gd.get("grdCd") or ""),
+        )
+        grddtl_by_grd.setdefault(key, []).append(gd)
+
+    # 국산(KOR) 먼저, 수입(IMP) 뒤 — 기존 Playwright depth_1 순서와 일치.
+    def _sort_key(m: dict[str, Any]) -> tuple[int, int]:
+        ct = str(m.get("carType") or "").upper()
+        return (0 if ct == "KOR" else 1 if ct == "IMP" else 2, 0)
+
+    mnuftrs_sorted = sorted(mnuftrs, key=_sort_key)
+
+    now = datetime.now()
+    date_str = now.strftime("%Y%m%d")
+    create_dt = now.strftime("%Y%m%d%H%M")
+    model_sn = 0
+
+    def _norm(val: Any) -> str:
+        s = (str(val) if val is not None else "").strip()
+        return s or "-"
+
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+
+        def _emit(depth_1, brand, car, model, model1, model2, period):
+            nonlocal model_sn
+            model_sn += 1
+            writer.writerow({
+                "model_sn": model_sn,
+                "depth_1": _norm(depth_1),
+                "brand_list": _norm(brand),
+                "car_list": _norm(car),
+                "model_list": _norm(model),
+                "model_list_1": _norm(model1),
+                "model_list_2": _norm(model2),
+                "production_period": _norm(period) if (period and str(period).strip()) else "-",
+                "date_crtr_pnttm": date_str,
+                "create_dt": create_dt,
+            })
+
+        for mnuftr in mnuftrs_sorted:
+            depth_1 = _kcar_api_category_cmn(mnuftr.get("carType") or "")
+            brand_name = str(mnuftr.get("mnuftrNm") or "").strip()
+            mnuftr_cd = str(mnuftr.get("mnuftrCd") or "").strip()
+            if not brand_name or not mnuftr_cd:
+                continue
+
+            model_grps = model_grp_by_mnuftr.get(mnuftr_cd) or []
+            if not model_grps:
+                _emit(depth_1, brand_name, "-", "-", "-", "-", "-")
+                continue
+
+            for mg in model_grps:
+                car_name = str(mg.get("modelGrpNm") or "").strip()
+                mg_cd = str(mg.get("modelGrpCd") or "").strip()
+                if not car_name:
+                    continue
+
+                models = model_by_grp.get((mnuftr_cd, mg_cd)) or []
+                if not models:
+                    _emit(depth_1, brand_name, car_name, "-", "-", "-", "-")
+                    continue
+
+                for mdl in models:
+                    model_name = str(mdl.get("modelNm") or "").strip()
+                    model_cd = str(mdl.get("modelCd") or "").strip()
+                    period = _parse_kcar_production_period(str(mdl.get("prdcnYear") or ""))
+                    if not model_name:
+                        continue
+
+                    grds = grd_by_model.get((mnuftr_cd, mg_cd, model_cd)) or []
+                    if not grds:
+                        _emit(depth_1, brand_name, car_name, model_name, "-", "-", period)
+                        continue
+
+                    for grd in grds:
+                        grd_name = str(grd.get("grdNm") or "").strip()
+                        grd_cd = str(grd.get("grdCd") or "").strip()
+                        if not grd_name:
+                            continue
+
+                        grddtls = grddtl_by_grd.get((mnuftr_cd, mg_cd, model_cd, grd_cd)) or []
+                        if not grddtls:
+                            _emit(depth_1, brand_name, car_name, model_name, grd_name, "-", period)
+                            continue
+
+                        for gd in grddtls:
+                            gd_name = str(gd.get("grdDtlNm") or "").strip()
+                            if not gd_name:
+                                _emit(depth_1, brand_name, car_name, model_name, grd_name, "-", period)
+                            else:
+                                _emit(depth_1, brand_name, car_name, model_name, grd_name, gd_name, period)
+
+    logger.info("K Car brand API 수집 완료: %s (총 %d건)", csv_path, model_sn)
+    return model_sn
+
+
+def _format_kcar_release_dt(mfg_dt: str) -> str:
+    """API mfgDt(YYYYMM) → 기존 CSV 포맷 'YY년 M월식'."""
+    s = (mfg_dt or "").strip()
+    if len(s) < 6 or not s[:6].isdigit():
+        return s
+    yy = s[2:4]
+    mm = str(int(s[4:6]))
+    return f"{yy}년 {mm}월식"
+
+
+def _format_kcar_price(prc: Any) -> str:
+    """'820' → '820만원', '1730' → '1,730만원'. 이미 포맷된 값은 그대로."""
+    s = str(prc or "").strip()
+    if not s:
+        return ""
+    if s.isdigit():
+        return f"{int(s):,}만원"
+    return s
+
+
+def _format_kcar_paymeth(inst_amt: Any) -> str:
+    s = str(inst_amt or "").strip()
+    if not s or s in {"0"}:
+        return ""
+    return f"할부 월 {s}만원"
+
+
+def _format_kcar_milg(milg: Any) -> str:
+    s = str(milg or "").strip()
+    if s.isdigit():
+        return f"{int(s):,}km"
+    return s
+
+
+def _format_kcar_local(cntr_nm: str) -> str:
+    """'분당용인직영점' → '분당용인'. '직영점' 접미사만 제거."""
+    s = (cntr_nm or "").strip()
+    if s.endswith("직영점"):
+        s = s[: -len("직영점")].strip()
+    return s
+
+
+def _download_kcar_list_image_requests(session: requests.Session, image_url: str, save_path: Path) -> bool:
+    if not image_url or not image_url.startswith("http"):
+        return False
+    for _ in range(2):
+        try:
+            r = session.get(image_url, timeout=20)
+            if r.status_code == 200 and r.content:
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                save_path.write_bytes(r.content)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _fetch_kcar_list_page(session: requests.Session, pageno: int, limit: int) -> list[dict[str, Any]]:
+    body = {"enc": _kcar_api_encrypt({"pageno": pageno, "limit": limit})}
+    resp = _kcar_api_post(session, "/bc/search/list", body)
+    data = resp.get("data") or {}
+    return data.get("rows") or []
+
+
+def _write_kcar_list_csv_via_api(
+    csv_path: Path,
+    list_save_dir: Path,
+    logger,
+) -> int:
+    headers = [
+        "model_sn",
+        "product_id",
+        "car_type_name",
+        "brand_list",
+        "car_list",
+        "model_list",
+        "model_list_1",
+        "model_list_2",
+        "car_name",
+        "car_exp",
+        "car_pay_meth",
+        "release_dt",
+        "car_navi",
+        "car_fuel",
+        "local_dos",
+        "detail_url",
+        "car_imgs",
+        "date_crtr_pnttm",
+        "create_dt",
+    ]
+    if csv_path.exists():
+        csv_path.unlink()
+
+    session = _kcar_api_session()
+    logger.info("K Car list API 수집 시작 (limit=%d, workers=%d)", KCAR_API_LIST_LIMIT, KCAR_API_LIST_WORKERS)
+
+    # 1페이지로 totalPageCnt 파악
+    first_body = _kcar_api_post(
+        session,
+        "/bc/search/list",
+        {"enc": _kcar_api_encrypt({"pageno": 1, "limit": KCAR_API_LIST_LIMIT})},
+    )
+    fdata = first_body.get("data") or {}
+    total_cnt = int(fdata.get("totalCnt") or 0)
+    total_pages = int(fdata.get("totalPageCnt") or 0)
+    first_rows = fdata.get("rows") or []
+    logger.info("  · totalCnt=%d, totalPageCnt=%d", total_cnt, total_pages)
+    if total_pages <= 0:
+        logger.warning("K Car list API: totalPageCnt <= 0 (응답 이상). 수집 중단.")
+        return 0
+
+    # 나머지 페이지 병렬 수집
+    page_rows: dict[int, list[dict[str, Any]]] = {1: first_rows}
+    if total_pages >= 2:
+        with ThreadPoolExecutor(max_workers=KCAR_API_LIST_WORKERS) as ex:
+            fut_map = {
+                ex.submit(_fetch_kcar_list_page, session, p, KCAR_API_LIST_LIMIT): p
+                for p in range(2, total_pages + 1)
+            }
+            done_pages = 1
+            for fut in as_completed(fut_map):
+                p = fut_map[fut]
+                try:
+                    page_rows[p] = fut.result()
+                except Exception as e:
+                    logger.warning("  · page=%d 수집 실패: %s", p, e)
+                    page_rows[p] = []
+                done_pages += 1
+                if done_pages % 20 == 0 or done_pages == total_pages:
+                    logger.info("  · page 진행: %d/%d", done_pages, total_pages)
+
+    # 순서 보존을 위해 pageno 오름차순으로 평탄화
+    all_rows: list[dict[str, Any]] = []
+    for p in range(1, total_pages + 1):
+        all_rows.extend(page_rows.get(p) or [])
+    logger.info("K Car list API: 수집 행 %d건 (필터·중복 제거 전)", len(all_rows))
+
+    # 직영중고차(detail_url 접근 가능) 매물만 남김.
+    # - carCd 가 'EC'로 시작 = 직영점 일반 매물. detail_url(i_sCarCd=EC...) 정상 조회 가능.
+    # - 그 외 접두사(BC*/RC*/숫자-only)는 /bc/search/list 응답에 섞여오지만
+    #   기존 Playwright 시대부터 수집 대상이 아니었고, i_sCarCd=EC{숫자}로도 detail 조회 불가.
+    # - 추가로 판매/가격 상태(reqStsCd/sellDcd/prc)가 정상인 행만 허용.
+    dropped_by_reason: dict[str, int] = {"non_ec_prefix": 0, "missing_status": 0}
+    filtered: list[dict[str, Any]] = []
+    for r in all_rows:
+        cid = str(r.get("carCd") or "").strip()
+        if not cid.startswith("EC"):
+            dropped_by_reason["non_ec_prefix"] += 1
+            continue
+        if not (
+            str(r.get("reqStsCd") or "").strip()
+            and str(r.get("sellDcd") or "").strip()
+            and str(r.get("prc") or "").strip()
+        ):
+            dropped_by_reason["missing_status"] += 1
+            continue
+        filtered.append(r)
+    if sum(dropped_by_reason.values()) > 0:
+        logger.info(
+            "K Car list API 필터: 전체 %d → 유효 %d (제외 %d: non_ec_prefix=%d, missing_status=%d)",
+            len(all_rows),
+            len(filtered),
+            sum(dropped_by_reason.values()),
+            dropped_by_reason["non_ec_prefix"],
+            dropped_by_reason["missing_status"],
+        )
+
+    # product_id(carCd) 기준 중복 제거
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for r in filtered:
+        cid = str(r.get("carCd") or "").strip()
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        deduped.append(r)
+    if len(deduped) != len(filtered):
+        logger.info("K Car list API 중복 제거: %d → %d", len(filtered), len(deduped))
+
+    now = datetime.now()
+    date_str = now.strftime("%Y%m%d")
+    create_dt = now.strftime("%Y%m%d%H%M")
+
+    # 이미지 병렬 다운로드 스케줄 (결과는 후에 car_imgs 컬럼에 병합)
+    img_paths: dict[str, str] = {}
+    img_jobs: list[tuple[str, str, Path]] = []
+    list_save_dir.mkdir(parents=True, exist_ok=True)
+    if images_enabled():
+        for row in deduped:
+            pid = str(row.get("carCd") or "").strip()
+            if not pid:
+                continue
+            src = (row.get("lsizeImgPath") or row.get("msizeImgPath") or row.get("ssizeImgPath") or "").strip()
+            if not src or not src.startswith("http"):
+                continue
+            out = list_save_dir / pid / f"{pid}_list.png"
+            img_jobs.append((pid, src, out))
+
+    if img_jobs:
+        logger.info("K Car list 이미지 다운로드: %d건, workers=%d", len(img_jobs), KCAR_API_IMAGE_WORKERS)
+        img_session = _kcar_api_session()
+        with ThreadPoolExecutor(max_workers=KCAR_API_IMAGE_WORKERS) as ex:
+            futs = {
+                ex.submit(_download_kcar_list_image_requests, img_session, src, out): (pid, out)
+                for pid, src, out in img_jobs
+            }
+            ok_count = 0
+            done = 0
+            for fut in as_completed(futs):
+                pid, out = futs[fut]
+                try:
+                    if fut.result():
+                        img_paths[pid] = str(out.resolve())
+                        ok_count += 1
+                except Exception:
+                    pass
+                done += 1
+                if done % 500 == 0 or done == len(img_jobs):
+                    logger.info("  · 이미지 진행: %d/%d (성공 %d)", done, len(img_jobs), ok_count)
+        logger.info("K Car list 이미지 저장 완료: %d/%d", ok_count, len(img_jobs))
+    else:
+        logger.info("images_enabled()=False → 이미지 다운로드 스킵")
+
+    # CSV 작성
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        for idx, row in enumerate(deduped, start=1):
+            pid = str(row.get("carCd") or "").strip() or "-"
+            writer.writerow([
+                idx,
+                pid,
+                str(row.get("carctgrNm") or "").strip() or "-",
+                str(row.get("mnuftrNm") or "").strip() or "-",
+                str(row.get("modelGrpNm") or "").strip() or "-",
+                str(row.get("modelNm") or "").strip() or "-",
+                str(row.get("grdNm") or "").strip() or "-",
+                str(row.get("grdDtlNm") or "").strip() or "-",
+                str(row.get("carWhlNm") or "").strip(),
+                _format_kcar_price(row.get("prc")),
+                _format_kcar_paymeth(row.get("instAmt")),
+                _format_kcar_release_dt(str(row.get("mfgDt") or "")),
+                _format_kcar_milg(row.get("milg")),
+                str(row.get("fuelNm") or "").strip(),
+                _format_kcar_local(str(row.get("cntrNm") or "")),
+                DETAIL_URL_TEMPLATE.format(pid) if pid != "-" else "-",
+                img_paths.get(pid, "-"),
+                date_str,
+                create_dt,
+            ])
+
+    logger.info("K Car list API 수집 완료: %s (총 %d건)", csv_path, len(deduped))
+    return len(deduped)
 
 
 def run_kcar_car_type_list(page, result_dir: Path, logger, csv_path: Path | None = None) -> None:
@@ -1964,6 +2486,14 @@ def _run_kcar_brand_csv(datst_cd: str, kwargs: dict[str, Any] | None = None) -> 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logger = _get_file_logger(run_ts)
     csv_path = RESULT_DIR / f"kcar_brand_list_{run_ts}.csv"
+
+    if USE_API_FOR_KCAR:
+        try:
+            _write_kcar_brand_csv_via_api(csv_path, logger)
+            return str(csv_path)
+        except Exception as e:
+            logger.warning("K Car brand API 실패 → Playwright 폴백: %s", e, exc_info=True)
+
     with sync_playwright() as p:
         browser = _launch_browser(p, HEADLESS_MODE, prefer_chrome=USE_CHROME_CHANNEL)
         context = browser.new_context(
@@ -2008,24 +2538,34 @@ def run_kcar_list_job(
     if list_path.exists():
         list_path.unlink()
 
-    with sync_playwright() as p:
-        browser = _launch_browser(p, HEADLESS_MODE, prefer_chrome=USE_CHROME_CHANNEL)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080},
-        )
-        page = context.new_page()
+    list_save_dir = IMG_BASE / "list"
+    used_api = False
+    if USE_API_FOR_KCAR:
         try:
-            run_kcar_list(
-                page,
-                RESULT_DIR,
-                logger,
-                csv_path=list_path,
-                brand_path=brand_path,
-                save_dir=IMG_BASE / "list",
+            _write_kcar_list_csv_via_api(list_path, list_save_dir, logger)
+            used_api = True
+        except Exception as e:
+            logger.warning("K Car list API 실패 → Playwright 폴백: %s", e, exc_info=True)
+
+    if not used_api:
+        with sync_playwright() as p:
+            browser = _launch_browser(p, HEADLESS_MODE, prefer_chrome=USE_CHROME_CHANNEL)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080},
             )
-        finally:
-            browser.close()
+            page = context.new_page()
+            try:
+                run_kcar_list(
+                    page,
+                    RESULT_DIR,
+                    logger,
+                    csv_path=list_path,
+                    brand_path=brand_path,
+                    save_dir=list_save_dir,
+                )
+            finally:
+                browser.close()
 
     count = 0
     if list_path.exists():
