@@ -5,6 +5,7 @@ import re
 import shutil
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -905,17 +906,104 @@ def _brand_collect_log(level: int, msg: str) -> None:
         pass
 
 
-def _brand_api_get(session, url, *, timeout=30, max_retries=3):
-    """브랜드 API GET + 재시도. 타임아웃/5xx 시 최대 max_retries회 재시도."""
-    for attempt in range(max_retries):
+# heydealer 브랜드 API 도메인 선호도: 관측상 `market-api.heydealer.com`이 api.heydealer.com보다
+# 훨씬 안정적. 기본 primary=market-api. 환경변수로 역전 가능.
+_HEYDEALER_BRAND_PRIMARY_HOST = os.environ.get("HEYDEALER_BRAND_API_PRIMARY", "market-api.heydealer.com").strip()
+_HEYDEALER_BRAND_ALT_HOST = (
+    "api.heydealer.com" if _HEYDEALER_BRAND_PRIMARY_HOST == "market-api.heydealer.com"
+    else "market-api.heydealer.com"
+)
+# 현재 세션에서 특정 도메인이 반복 hang하는 걸 감지해 한동안 skip (adaptive)
+_HEYDEALER_BRAND_DEGRADED: dict[str, int] = {}
+_HEYDEALER_BRAND_DEGRADE_THRESHOLD = 3  # 연속 3회 타임아웃이면 degraded 표시
+_HEYDEALER_BRAND_DEGRADE_SKIP_COUNT = 50  # degraded 표시 후 이 횟수만큼 해당 도메인 건너뜀
+
+
+def _heydealer_rewrite_host(url: str, new_host: str) -> str:
+    """URL의 호스트만 교체 (path/query 유지)."""
+    for host in ("api.heydealer.com", "market-api.heydealer.com"):
+        prefix = f"https://{host}/"
+        if url.startswith(prefix):
+            return f"https://{new_host}/" + url[len(prefix):]
+    return url
+
+
+def _brand_api_get(session, url, *, timeout=None, max_retries=6):
+    """
+    브랜드 API GET + 재시도.
+    - primary=market-api.heydealer.com (관측상 안정적). 환경변수 HEYDEALER_BRAND_API_PRIMARY로 역전 가능.
+    - 짧은 timeout + 도메인 스왑 전략: 시도#1 primary(15s) → #2 alt(15s) → #3 primary(30s) → ...
+    - Adaptive: 특정 도메인에서 연속 타임아웃이 임계치를 넘으면 해당 도메인을 일정 호출 동안 skip.
+    """
+    env_timeouts = os.environ.get("HEYDEALER_BRAND_API_TIMEOUTS", "").strip()
+    env_retries = os.environ.get("HEYDEALER_BRAND_API_RETRIES", "").strip()
+    if env_retries.isdigit():
+        max_retries = int(env_retries)
+
+    default_timeouts = [15, 15, 30, 30, 60, 60]
+    if env_timeouts:
         try:
-            resp = session.get(url, timeout=timeout)
+            default_timeouts = [int(x) for x in env_timeouts.split(",") if x.strip().isdigit()]
+        except Exception:
+            pass
+    timeouts = (default_timeouts + [default_timeouts[-1]] * max_retries)[:max_retries]
+
+    # 기본 URL을 primary 호스트로 강제 (원 URL이 api.heydealer.com이어도 primary로 우선 시도)
+    primary_url = _heydealer_rewrite_host(url, _HEYDEALER_BRAND_PRIMARY_HOST)
+    alt_url = _heydealer_rewrite_host(url, _HEYDEALER_BRAND_ALT_HOST)
+
+    # degraded 도메인 스킵 감소 카운터 업데이트
+    hosts_to_try_order: list[str] = []
+    for i in range(max_retries):
+        # 짝수 시도 → primary, 홀수 시도 → alt (단, degraded면 반대 도메인 사용)
+        default_host = _HEYDEALER_BRAND_PRIMARY_HOST if i % 2 == 0 else _HEYDEALER_BRAND_ALT_HOST
+        other_host = _HEYDEALER_BRAND_ALT_HOST if i % 2 == 0 else _HEYDEALER_BRAND_PRIMARY_HOST
+        # degraded면 skip 카운터 감소시키고 반대 도메인 사용
+        if _HEYDEALER_BRAND_DEGRADED.get(default_host, 0) > 0:
+            _HEYDEALER_BRAND_DEGRADED[default_host] -= 1
+            hosts_to_try_order.append(other_host)
+        else:
+            hosts_to_try_order.append(default_host)
+
+    for attempt in range(max_retries):
+        host = hosts_to_try_order[attempt]
+        target_url = primary_url if host == _HEYDEALER_BRAND_PRIMARY_HOST else alt_url
+        cur_timeout = timeouts[attempt]
+        try:
+            resp = session.get(target_url, timeout=cur_timeout)
             if resp.status_code < 500:
+                # 성공 → 해당 호스트 degraded 카운터 리셋
+                _HEYDEALER_BRAND_DEGRADED[host] = 0
+                if attempt > 0:
+                    _brand_collect_log(
+                        logging.INFO,
+                        f"API 복구(시도 {attempt + 1}/{max_retries}, {cur_timeout}s): {target_url[:120]}",
+                    )
                 return resp
-            _brand_collect_log(logging.WARNING, f"API {resp.status_code} (시도 {attempt + 1}/{max_retries}): {url[:120]}")
+            _brand_collect_log(
+                logging.WARNING,
+                f"API {resp.status_code} (시도 {attempt + 1}/{max_retries}): {target_url[:120]}",
+            )
+        except requests.Timeout:
+            # degraded 감지: 해당 호스트 연속 타임아웃 누적
+            _HEYDEALER_BRAND_DEGRADED[host] = _HEYDEALER_BRAND_DEGRADED.get(host, 0) + 1
+            if _HEYDEALER_BRAND_DEGRADED[host] == _HEYDEALER_BRAND_DEGRADE_THRESHOLD:
+                _brand_collect_log(
+                    logging.WARNING,
+                    f"[{host}] 연속 {_HEYDEALER_BRAND_DEGRADE_THRESHOLD}회 타임아웃 → "
+                    f"이후 {_HEYDEALER_BRAND_DEGRADE_SKIP_COUNT}회 호출 동안 해당 도메인 skip",
+                )
+                _HEYDEALER_BRAND_DEGRADED[host] = _HEYDEALER_BRAND_DEGRADE_SKIP_COUNT
+            _brand_collect_log(
+                logging.WARNING,
+                f"API 타임아웃 (시도 {attempt + 1}/{max_retries}, timeout={cur_timeout}s): {target_url[:120]}",
+            )
         except Exception as e:
-            _brand_collect_log(logging.WARNING, f"API 요청 실패 (시도 {attempt + 1}/{max_retries}): {e}")
-        time.sleep(2 + attempt * 2)
+            _brand_collect_log(
+                logging.WARNING,
+                f"API 요청 실패 (시도 {attempt + 1}/{max_retries}): {type(e).__name__}: {e}",
+            )
+        time.sleep(min(4, 0.5 + attempt * 0.7))
     return None
 
 
@@ -925,10 +1013,22 @@ def fetch_and_save_brand_csv():
         BRAND_LIST_FILE.unlink()
     API_BASE = "https://api.heydealer.com/v2/customers/web/market/car_meta"
     session = requests.Session()
+    # 브라우저 동등 헤더(Referer/Origin) + 세션 쿠키 사전 확보로 간헐적 hang 완화.
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "application/json",
+        "Referer": "https://www.heydealer.com/",
+        "Origin": "https://www.heydealer.com",
     })
+    try:
+        session.post(
+            "https://api.heydealer.com/v2/customers/web/initialize_app/",
+            json={"referrer_url": "https://www.heydealer.com/market/cars"},
+            timeout=30,
+        )
+    except Exception:
+        # 쿠키 없이도 대체로 동작하므로 실패해도 무시
+        pass
     d_pnttm = datetime.now().strftime("%Y%m%d")
     c_dt = datetime.now().strftime("%Y%m%d%H%M")
     n_written = 0
@@ -940,7 +1040,7 @@ def fetch_and_save_brand_csv():
         _brand_collect_log(logging.INFO, "=" * 60)
         brands_resp = _brand_api_get(session, f"{API_BASE}/brands/")
         if not brands_resp or brands_resp.status_code != 200:
-            raise RuntimeError(f"브랜드 목록 API 실패 (3회 재시도 후)")
+            raise RuntimeError("브랜드 목록 API 실패 (재시도 후)")
         raw = brands_resp.json()
         brands = raw if isinstance(raw, list) else (raw.get("brands") or raw.get("data") or []) if isinstance(raw, dict) else []
         n_brands = len(brands)
@@ -1898,6 +1998,297 @@ def _extract_card_heydealer(elem, idx, brand_map, car_type="", brand_by_name=Non
     except: pass
     return data
 
+# ═══════════════════════════════════════════════════════════════════
+#  헤이딜러 목록 API 기반 수집 (Playwright 없이 직접 JSON 호출)
+# ═══════════════════════════════════════════════════════════════════
+
+# 기본 활성. 문제 생기면 HEYDEALER_USE_API=0 으로 기존 Playwright 방식 강제.
+HEYDEALER_USE_API = os.environ.get("HEYDEALER_USE_API", "1").strip().lower() in ("1", "true", "yes")
+HEYDEALER_LIST_API_URL = "https://market-api.heydealer.com/v2/customers/web/market/cars/"
+HEYDEALER_INIT_API_URL = "https://api.heydealer.com/v2/customers/web/initialize_app/"
+# heydealer는 병렬 요청에 민감(rate-limit 유발) → 직렬 호출 + 짧은 지터 sleep.
+HEYDEALER_API_PAGE_SLEEP_MS = int(os.environ.get("HEYDEALER_API_PAGE_SLEEP_MS", "60"))
+HEYDEALER_API_RETRIES = int(os.environ.get("HEYDEALER_API_RETRIES", "3"))
+HEYDEALER_API_TIMEOUT = int(os.environ.get("HEYDEALER_API_TIMEOUT", "30"))
+# 이미지 CDN은 병렬 다운로드 가능 (API 서버와 별개).
+HEYDEALER_IMG_WORKERS = int(os.environ.get("HEYDEALER_IMG_WORKERS", "16"))
+HEYDEALER_API_DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Referer": "https://www.heydealer.com/",
+    "Origin": "https://www.heydealer.com",
+}
+
+
+def _heydealer_api_session() -> requests.Session:
+    """initialize_app 호출로 세션 쿠키 세팅 후 반환. 실패 시 쿠키 없이도 반환."""
+    s = requests.Session()
+    s.headers.update(HEYDEALER_API_DEFAULT_HEADERS)
+    try:
+        s.post(
+            HEYDEALER_INIT_API_URL,
+            json={"referrer_url": "https://www.heydealer.com/market/cars"},
+            timeout=HEYDEALER_API_TIMEOUT,
+        )
+    except Exception:
+        # 쿠키 없이도 일부 호출은 가능하므로 세션 자체는 반환
+        pass
+    return s
+
+
+def _fetch_heydealer_page(
+    session: requests.Session,
+    car_shape: str,
+    page_num: int,
+    *,
+    logger,
+) -> list[dict[str, Any]] | None:
+    """한 페이지 GET 호출 + 재시도. 쿠키 만료 시 재초기화까지 수행."""
+    params = {"order": "recommendation", "view_type": "image", "page": page_num}
+    if car_shape:
+        params["car_shape"] = car_shape
+    last_status: int | str | None = None
+    for attempt in range(HEYDEALER_API_RETRIES):
+        try:
+            resp = session.get(HEYDEALER_LIST_API_URL, params=params, timeout=HEYDEALER_API_TIMEOUT)
+            last_status = resp.status_code
+            if resp.status_code == 200:
+                try:
+                    payload = resp.json()
+                    if isinstance(payload, list):
+                        return payload
+                except ValueError:
+                    pass
+                return []
+            # 500 발생 시 세션 쿠키 만료 가능성 → 재초기화 후 재시도
+            if resp.status_code in (401, 403, 500):
+                try:
+                    session.post(
+                        HEYDEALER_INIT_API_URL,
+                        json={"referrer_url": "https://www.heydealer.com/market/cars"},
+                        timeout=HEYDEALER_API_TIMEOUT,
+                    )
+                except Exception:
+                    pass
+        except requests.RequestException as e:
+            last_status = f"{type(e).__name__}: {e}"
+        time.sleep(0.5 + attempt * 0.7)
+    logger.warning("heydealer API page=%d car_shape=%s 실패(상태=%s)", page_num, car_shape or "-", last_status)
+    return None
+
+
+def _run_heydealer_list_via_api(
+    bsc: TnDataBscInfo,
+    *,
+    list_fields: list[str],
+    brand_map: dict[str, Any],
+    brand_by_name: dict[str, Any],
+    brand_matcher: dict[str, Any],
+    car_type_entries: list[tuple[str, str]],
+    today_img_dir_list: Path,
+    run_logger,
+) -> list[dict[str, Any]]:
+    """
+    /market/cars/ JSON API만으로 목록 전체 수집.
+    - 차종(car_type) 단위로 직렬 페이지네이션(서버가 병렬에 민감).
+    - 이미지는 수집 완료 후 병렬 다운로드.
+    - item 스키마 / brand 매핑 / CSV append 로직은 기존 Playwright 루트와 동일 유지.
+    """
+    run_logger.info("[1단계] 목록 API 수집 시작 (HEYDEALER_USE_API=1)")
+    if LIST_FILE.exists():
+        LIST_FILE.unlink()
+
+    session = _heydealer_api_session()
+    raw_list: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    sleep_sec = max(HEYDEALER_API_PAGE_SLEEP_MS, 0) / 1000.0
+
+    for car_type_value, car_type_raw_name in car_type_entries:
+        car_type_name = (car_type_raw_name or "").strip()
+        display_name = car_type_name or "전체"
+        collected_this_type = 0
+        page_num = 1
+        consecutive_empty = 0
+        MAX_CONSECUTIVE_EMPTY = 3
+
+        run_logger.info("[%s] 목록 API 수집 시작", display_name)
+
+        while True:
+            cars = _fetch_heydealer_page(session, car_type_value or "", page_num, logger=run_logger)
+            if cars is None:
+                # 재시도 소진 실패
+                consecutive_empty += 1
+                if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
+                    run_logger.info(
+                        "[%s] 연속 %d회 API 실패 → 차종 종료 (page=%d, 수집 %d건)",
+                        display_name, MAX_CONSECUTIVE_EMPTY, page_num, collected_this_type,
+                    )
+                    break
+                page_num += 1
+                continue
+            if not cars:
+                run_logger.info(
+                    "[%s] 빈 응답 → 차종 수집 종료 (page=%d, 수집 %d건)",
+                    display_name, page_num, collected_this_type,
+                )
+                break
+
+            consecutive_empty = 0
+            new_card_count = 0
+
+            for car in cars:
+                hash_id = (car.get("hash_id") or "").strip()
+                if not hash_id or hash_id in seen:
+                    continue
+                seen.add(hash_id)
+
+                detail = car.get("detail_info") or {}
+                image_urls = detail.get("image_urls") or []
+                model_name = (detail.get("model_name") or "").strip()
+                model_part_name = (detail.get("model_part_name") or "").strip()
+                grade_name = (detail.get("grade_name") or "").strip()
+                detail_name = (detail.get("detail_name") or "").strip()
+                grade_part_name = (detail.get("grade_part_name") or "").strip()
+
+                year_raw = detail.get("year") or ""
+                mileage_raw = detail.get("mileage") or ""
+                year_str = str(year_raw).strip() if year_raw else ""
+                km_str = (
+                    f"{mileage_raw:,}km"
+                    if isinstance(mileage_raw, (int, float)) and mileage_raw
+                    else str(mileage_raw).strip()
+                )
+
+                price_raw = car.get("price") or ""
+                sale_price = (
+                    f"{price_raw}만원"
+                    if isinstance(price_raw, (int, float)) and price_raw
+                    else str(price_raw).strip()
+                )
+
+                detail_url = f"https://www.heydealer.com/market/cars/{hash_id}"
+                car_name = " ".join(p for p in [model_part_name, grade_part_name] if p).strip() or model_name
+                first_image_url = image_urls[0] if image_urls else ""
+
+                d_pnttm, c_dt = get_now_times()
+                item: dict[str, Any] = {
+                    "model_sn": len(raw_list) + 1,
+                    "product_id": hash_id,
+                    "car_type": car_type_name,
+                    "brand_list": "",
+                    "car_list": "",
+                    "model_list": model_name,
+                    "model_list_1": grade_name,
+                    "model_list_2": detail_name,
+                    "car_name": car_name,
+                    "year": year_str,
+                    "km": km_str,
+                    "sale_price": sale_price,
+                    "detail_url": detail_url,
+                    "car_imgs": "",
+                    "list_image_url": first_image_url,
+                    "date_crtr_pnttm": d_pnttm,
+                    "create_dt": c_dt,
+                }
+
+                # 브랜드명 보강: model_part_name 말미에서 추출 → brand_map / brand_by_name 폴백
+                if model_part_name and model_name and model_part_name.endswith(model_name):
+                    brand_name_extracted = model_part_name[: -len(model_name)].strip()
+                    if brand_name_extracted:
+                        matched = brand_map.get(model_name) or (
+                            brand_by_name.get(brand_name_extracted) if brand_by_name else None
+                        )
+                        if matched:
+                            item["brand_list"] = matched.get("brand_name", "")
+
+                br = _find_matching_brand_row(item, brand_matcher)
+                if br:
+                    item["brand_list"] = (br.get("brand_list") or "").strip()
+                    item["car_list"] = (br.get("car_list") or "").strip()
+                    item["model_list"] = (br.get("model_list") or "").strip()
+                    item["model_list_1"] = (br.get("model_list_1") or "").strip()
+                    item["model_list_2"] = (br.get("model_list_2") or "").strip()
+
+                raw_list.append(item)
+                save_to_csv_append(LIST_FILE, list_fields, item)
+                collected_this_type += 1
+                new_card_count += 1
+
+            run_logger.info(
+                "[%s] page=%d 신규 %d건 (이번 차종 누적 %d건, 전체 %d건)",
+                display_name, page_num, new_card_count, collected_this_type, len(raw_list),
+            )
+
+            if new_card_count == 0:
+                consecutive_empty += 1
+                if consecutive_empty >= MAX_CONSECUTIVE_EMPTY:
+                    run_logger.info(
+                        "[%s] 연속 %d회 신규 0건 → 차종 종료",
+                        display_name, MAX_CONSECUTIVE_EMPTY,
+                    )
+                    break
+
+            page_num += 1
+            if sleep_sec > 0:
+                time.sleep(sleep_sec)
+
+        run_logger.info(
+            "[%s] 차종 완료 (이번 차종 %d건, 전체 %d건)",
+            display_name, collected_this_type, len(raw_list),
+        )
+
+    run_logger.info("[1단계] 목록 API 수집 완료: %s (%d건)", LIST_FILE, len(raw_list))
+
+    # 이미지 병렬 다운로드 (CDN은 별도 서버라 병렬 가능)
+    if raw_list:
+        _download_heydealer_list_images_parallel(raw_list, run_logger)
+
+    # list_image_url 제거 및 원자 쓰기
+    rewrite_csv_atomic(LIST_FILE, list_fields, raw_list)
+    return raw_list
+
+
+def _download_heydealer_list_images_parallel(raw_list: list[dict[str, Any]], logger) -> None:
+    """대표 이미지 1장씩 병렬 다운로드. 성공 시 item['car_imgs']에 저장 경로 기록."""
+    jobs: list[tuple[dict[str, Any], str]] = []
+    for item in raw_list:
+        url = (item.get("list_image_url") or "").strip()
+        pid = (item.get("product_id") or "").strip()
+        if url and pid:
+            jobs.append((item, url))
+    if not jobs:
+        logger.info("[2단계] 다운로드할 이미지 URL 없음")
+        return
+
+    logger.info("[2단계] 목록 이미지 병렬 다운로드: %d건, workers=%d", len(jobs), HEYDEALER_IMG_WORKERS)
+    done = 0
+    ok = 0
+
+    def _job(pair):
+        item, url = pair
+        pid = item.get("product_id", "")
+        saved = download_list_image(url, pid)
+        return item, saved
+
+    with ThreadPoolExecutor(max_workers=HEYDEALER_IMG_WORKERS) as ex:
+        futs = [ex.submit(_job, pair) for pair in jobs]
+        for fut in as_completed(futs):
+            try:
+                item, saved = fut.result()
+                if saved:
+                    item["car_imgs"] = saved
+                    ok += 1
+            except Exception:
+                pass
+            done += 1
+            if done % 200 == 0 or done == len(jobs):
+                logger.info("[2단계] 이미지 진행: %d/%d (성공 %d)", done, len(jobs), ok)
+    logger.info("[2단계] 목록 이미지 완료: %d/%d", ok, len(jobs))
+
+
 def run_heydealer_job(
     bsc: TnDataBscInfo,
     *,
@@ -1981,6 +2372,34 @@ def run_heydealer_job(
     brand_rows = load_brand_rows()
     brand_matcher = build_brand_row_matcher(brand_rows)
 
+    # ── API 경로: Playwright 없이 JSON API 직접 호출 ──────────────────────
+    if HEYDEALER_USE_API:
+        try:
+            raw_list = _run_heydealer_list_via_api(
+                bsc,
+                list_fields=list_fields,
+                brand_map=brand_map,
+                brand_by_name=brand_by_name,
+                brand_matcher=brand_matcher,
+                car_type_entries=car_type_entries,
+                today_img_dir_list=today_img_dir_list,
+                run_logger=run_logger,
+            )
+            return {
+                "brand_csv": str(BRAND_LIST_FILE),
+                "car_type_csv": str(CAR_TYPE_LIST_FILE),
+                "list_csv": str(LIST_FILE),
+                "count": len(raw_list),
+                "log_file": str(LOG_FILE),
+            }
+        except Exception as e:
+            run_logger.warning("헤이딜러 list API 경로 실패 → Playwright 폴백: %s", e, exc_info=True)
+            raw_list = []
+            seen.clear()
+            if LIST_FILE.exists():
+                LIST_FILE.unlink()
+
+    # ── Playwright 폴백 (기존 구현) ────────────────────────────────────
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as pw:

@@ -1675,10 +1675,18 @@ def download_autoinside_list_image(
     )
 
 
-def _scroll_list_until_end(page, item_selector: str, logger, max_no_new_rounds: int = 2, scroll_pause_ms: int = 2000):
+def _scroll_list_until_end(
+    page,
+    item_selector: str,
+    logger,
+    max_no_new_rounds: int = 4,
+    scroll_pause_ms: int = 4000,
+):
     """
     무한 스크롤 페이지에서 끝까지 스크롤하여 모든 목록이 DOM에 로드되도록 한다.
     스크롤 후 item_selector 개수가 더 이상 늘지 않으면 종료.
+    야간 스케줄 실행 시 서버 응답 지연으로 조기 종료되는 것을 막기 위해
+    대기시간을 늘리고, count가 안 늘어도 다시 스크롤을 시도하며, AJAX 완료 대기.
     """
     no_new_rounds = 0
     last_count = 0
@@ -1692,19 +1700,29 @@ def _scroll_list_until_end(page, item_selector: str, logger, max_no_new_rounds: 
             if no_new_rounds >= max_no_new_rounds:
                 logger.info("스크롤 완료: 목록 개수 %d로 고정", count)
                 return count
-            page.wait_for_timeout(1000)
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(scroll_pause_ms)
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
             continue
         no_new_rounds = 0
         last_count = count
         last_height = page.evaluate("document.body.scrollHeight")
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(scroll_pause_ms)
+        try:
+            page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass
         new_height = page.evaluate("document.body.scrollHeight")
         if new_height == last_height:
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(2500)
             if page.evaluate("document.body.scrollHeight") == last_height:
-                logger.info("페이지 끝 도달, 목록 %d개", page.locator(item_selector).count())
-                return page.locator(item_selector).count()
+                final = page.locator(item_selector).count()
+                logger.info("페이지 끝 도달, 목록 %d개", final)
+                return final
     return last_count
 
 

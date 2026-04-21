@@ -400,10 +400,18 @@ def _sync_reborncar_tmp_to_source(
                 )
 
             # 2) source 갱신: tmp에 있는 행 → 컬럼 업데이트 + register_flag = 'Y'
+            #    단, 기존에 'N'(판매종료/유령차량 영구차단) 으로 마킹된 행은 그대로 보존.
+            #    - 리본카 리스트는 detail 이 죽은 "유령 차량" 을 계속 노출하기 때문에
+            #      retry DAG 가 영구 실패 루프에 빠지는 것을 방지.
             update_cols = [c for c in tmp_cols if c in set(src_cols) and c not in set(key_cols)]
             set_expr = ", ".join([f'"{c}" = tmp."{c}"' for c in update_cols if c != flag_col])
             if src_has_flag:
-                set_expr = (set_expr + ", " if set_expr else "") + f'"{flag_col}" = \'Y\''
+                flag_case = (
+                    f'"{flag_col}" = CASE '
+                    f'WHEN TRIM(COALESCE(src."{flag_col}"::text, \'\')) = \'N\' THEN \'N\' '
+                    f'ELSE \'Y\' END'
+                )
+                set_expr = (set_expr + ", " if set_expr else "") + flag_case
             if set_expr:
                 cur.execute(
                     f"""
@@ -414,7 +422,7 @@ def _sync_reborncar_tmp_to_source(
                     """
                 )
                 logging.info(
-                    "reborncar sync [2] source 기존 행 Y 갱신: %d건",
+                    "reborncar sync [2] source 기존 행 Y 갱신(기존 'N' 보존): %d건",
                     cur.rowcount,
                 )
 
