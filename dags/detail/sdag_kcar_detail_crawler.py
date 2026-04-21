@@ -7,12 +7,14 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
 import pendulum
+import requests
 from airflow.decorators import dag, task, task_group
 from airflow.exceptions import AirflowException
 from airflow.models import Variable
@@ -24,6 +26,10 @@ if str(_root) not in sys.path:
 
 from util.common_util import CommonUtil
 from util.playwright_util import GotoSpec, goto_with_retry, images_enabled, install_route_blocking
+
+
+# 상세 이미지 다운로드 병렬 워커 수 (환경변수로 조절)
+KCAR_DETAIL_IMG_WORKERS = int(os.environ.get("KCAR_DETAIL_IMG_WORKERS", "8"))
 
 
 def _is_playwright_dead_error(err: BaseException) -> bool:
@@ -481,7 +487,7 @@ def kcar_detail_crawl():
                     context, page = _new_context_and_page()
                     logging.info("kcar detail browser context 재생성 완료: processed=%d/%d", idx, total)
 
-                time.sleep(0.2)  # 서버 부하 방지(너무 짧게 하면 차단 위험)
+                time.sleep(0.05)  # 서버 부하 방지(병렬 이미지 다운로드로 자연스러운 간격 확보)
 
             try:
                 browser.close()
@@ -1136,6 +1142,69 @@ def _download_detail_image(page, img_src: str, save_path: Path, *, referer: str)
     return False
 
 
+def _download_image_requests(img_src: str, save_path: Path, *, referer: str) -> bool:
+    """
+    ThreadPoolExecutor 에서 병렬 실행하기 위한 requests 기반 이미지 다운로드.
+    Playwright APIRequestContext 는 스레드-세이프하지 않아 requests 로 대체.
+    """
+    if not images_enabled():
+        return False
+    if not img_src or not isinstance(img_src, str):
+        return False
+    if img_src.startswith("data:") or not img_src.startswith("http"):
+        return False
+    ref = (referer or "").split("#")[0] or "https://www.kcar.com/"
+    headers = {
+        "Referer": ref,
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    for attempt in range(2):
+        try:
+            r = requests.get(img_src, headers=headers, timeout=15)
+            if r.status_code == 200 and r.content:
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                save_path.write_bytes(r.content)
+                return True
+        except Exception as e:
+            if attempt >= 1:
+                logging.getLogger(__name__).debug(
+                    "kcar detail 이미지(requests) 다운로드 실패 %s: %s", img_src[:100], e
+                )
+    return False
+
+
+def _download_images_parallel(
+    urls: list[str],
+    product_id: str,
+    detail_img_dir: Path,
+    referer: str,
+    max_workers: int = KCAR_DETAIL_IMG_WORKERS,
+) -> int:
+    """
+    갤러리 이미지들을 ThreadPoolExecutor 로 병렬 다운로드. 저장된 건수 반환.
+    """
+    if not urls:
+        return 0
+    ok = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {}
+        for idx, img_url in enumerate(urls, 1):
+            out = detail_img_dir / f"{product_id}_{idx}.png"
+            futs[ex.submit(_download_image_requests, img_url, out, referer=referer)] = idx
+        for fut in as_completed(futs):
+            try:
+                if fut.result():
+                    ok += 1
+            except Exception:
+                pass
+    return ok
+
+
 def _norm_img_src(raw: str, page_url: str) -> str:
     src = (raw or "").strip()
     if not src or src.startswith("data:"):
@@ -1417,7 +1486,7 @@ def _crawl_one(page, idx: int, product_id: str, detail_url: str, detail_img_dir:
                 logger=logging.getLogger(__name__),
                 attempts=1,
             )
-            page.wait_for_timeout(800)
+            page.wait_for_timeout(400)
             _dismiss_kcar_popups(page)
             break
         except Exception as e:
@@ -1511,7 +1580,7 @@ def _crawl_one(page, idx: int, product_id: str, detail_url: str, detail_img_dir:
                 hint.scroll_into_view_if_needed(timeout=5000)
         except Exception:
             pass
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(200)
 
         has_detail_box = _kcar_first_option_detail_box(page) is not None
         has_list_wrap = _kcar_first_option_list_wrap(page) is not None
@@ -1621,19 +1690,15 @@ def _crawl_one(page, idx: int, product_id: str, detail_url: str, detail_img_dir:
             if dw:
                 data["detail_warranty"] = dw
 
-        # ── 갤러리 이미지 다운로드 ─────
+        # ── 갤러리 이미지 다운로드 (병렬) ─────
         try:
             urls = _collect_kcar_gallery_image_urls(page)
             if urls:
                 referer = (page.url or "").split("#")[0] or "https://www.kcar.com/"
-                ok = 0
-                for img_idx, img_url in enumerate(urls, 1):
-                    out = detail_img_dir / f"{product_id}_{img_idx}.png"
-                    if _download_detail_image(page, img_url, out, referer=referer):
-                        ok += 1
+                ok = _download_images_parallel(urls, product_id, detail_img_dir, referer)
                 logging.info(
-                    "kcar 이미지 저장: product_id=%s, 추출=%d건, 저장=%d건",
-                    product_id, len(urls), ok,
+                    "kcar 이미지 저장(병렬 workers=%d): product_id=%s, 추출=%d건, 저장=%d건",
+                    KCAR_DETAIL_IMG_WORKERS, product_id, len(urls), ok,
                 )
             else:
                 logging.warning("kcar 이미지 URL 없음: product_id=%s", product_id)

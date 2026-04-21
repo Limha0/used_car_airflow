@@ -1,14 +1,17 @@
 import csv
 import logging
+import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
 import pendulum
+import requests
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
@@ -20,6 +23,10 @@ if str(_root) not in sys.path:
 
 from util.common_util import CommonUtil
 from util.playwright_util import GotoSpec, goto_with_retry, images_enabled, install_route_blocking
+
+
+# 상세 이미지 다운로드 병렬 워커 수 (환경변수로 조절)
+HEYDEALER_DETAIL_IMG_WORKERS = int(os.environ.get("HEYDEALER_DETAIL_IMG_WORKERS", "8"))
 
 # ═══════════════════════════════════════════════════════════════════
 #  상수
@@ -384,7 +391,7 @@ def heydealer_detail_crawl():
                     )
                     logging.info("브라우저 컨텍스트 재생성 완료: processed=%d/%d", idx, total)
 
-                time.sleep(0.3)  # 서버 부하 방지
+                time.sleep(0.1)  # 서버 부하 방지(병렬 이미지 다운로드로 자연스러운 간격 확보)
 
             browser.close()
 
@@ -844,11 +851,11 @@ def _collect_heydealer_detail_gallery_urls(page) -> list[str]:
         except Exception:
             return False
 
-    # ── 1) 관리 상태 섹션까지 스크롤 ──
+    # ── 1) 관리 상태 섹션까지 스크롤 (횟수 축소: 15→8, 간격 300→180ms) ──
     try:
-        for _ in range(15):
+        for _ in range(8):
             page.evaluate("window.scrollBy(0, window.innerHeight)")
-            page.wait_for_timeout(300)
+            page.wait_for_timeout(180)
     except Exception:
         pass
 
@@ -888,7 +895,7 @@ def _collect_heydealer_detail_gallery_urls(page) -> list[str]:
         logging.info("헤이딜러 이미지 [관리상태 이미지 클릭 실패]")
         return urls
 
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(800)  # 2000 → 800
     logging.info("헤이딜러 이미지 [갤러리 모달 열림]")
 
     # ── 3) 실내/외부/하부/스크래치 탭 순회 → 모달 안 이미지만 수집 ──
@@ -896,7 +903,7 @@ def _collect_heydealer_detail_gallery_urls(page) -> list[str]:
         try:
             before = len(urls)
             if _click_tab(tab_name):
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(600)  # 1500 → 600
                 _collect_modal_imgs()
                 logging.info(
                     "헤이딜러 이미지 [%s 탭]: +%d건 (누적 %d건)",
@@ -909,7 +916,7 @@ def _collect_heydealer_detail_gallery_urls(page) -> list[str]:
 
     try:
         page.keyboard.press("Escape")
-        page.wait_for_timeout(300)
+        page.wait_for_timeout(150)  # 300 → 150
     except Exception:
         pass
 
@@ -934,6 +941,62 @@ def _download_detail_gallery_image(page, image_url: str, save_path: Path) -> boo
         return True
     except Exception:
         return False
+
+
+def _download_image_requests(image_url: str, save_path: Path, *, referer: str) -> bool:
+    """
+    ThreadPoolExecutor 에서 병렬 실행하기 위한 requests 기반 이미지 다운로드.
+    Playwright APIRequestContext 는 스레드-세이프하지 않아 requests 로 대체.
+    """
+    if not image_url or not isinstance(image_url, str):
+        return False
+    if image_url.startswith("data:") or not image_url.startswith("http"):
+        return False
+    ref = (referer or "").split("#")[0] or "https://www.heydealer.com/"
+    headers = {
+        "Referer": ref,
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    for attempt in range(2):
+        try:
+            r = requests.get(image_url, headers=headers, timeout=15)
+            if r.status_code == 200 and r.content:
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                save_path.write_bytes(r.content)
+                return True
+        except Exception:
+            if attempt >= 1:
+                return False
+    return False
+
+
+def _download_gallery_images_parallel(
+    urls: list[str],
+    product_id: str,
+    detail_img_dir: Path,
+    referer: str,
+    max_workers: int = HEYDEALER_DETAIL_IMG_WORKERS,
+) -> int:
+    """갤러리 이미지를 ThreadPoolExecutor 로 병렬 다운로드. 저장 성공 건수 반환."""
+    if not urls:
+        return 0
+    ok = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {}
+        for idx, img_url in enumerate(urls, 1):
+            out = detail_img_dir / f"{product_id}_{idx}.png"
+            futs[ex.submit(_download_image_requests, img_url, out, referer=referer)] = idx
+        for fut in as_completed(futs):
+            try:
+                if fut.result():
+                    ok += 1
+            except Exception:
+                pass
+    return ok
 
 
 def _parse_inspection(record_items_locator, label_text: str) -> str:
@@ -1201,18 +1264,18 @@ def _crawl_one(
         except Exception as e:
             logging.debug("[섹션5] %s : %s", product_id, e)
 
-        # ── 색상 + 관리상태(실내/외부/하부/스크래치) 이미지 저장 ──
+        # ── 색상 + 관리상태(실내/외부/하부/스크래치) 이미지 저장 (병렬 다운로드) ──
         try:
             gallery_urls = _collect_heydealer_detail_gallery_urls(page)
-            saved = 0
-            for gi, gurl in enumerate(gallery_urls, start=1):
-                out = detail_img_dir / f"{product_id}_{gi}.png"
-                if _download_detail_gallery_image(page, gurl, out):
-                    saved += 1
-            logging.info(
-                "헤이딜러 이미지 저장: product_id=%s, 추출=%d건, 저장=%d건",
-                product_id, len(gallery_urls), saved,
-            )
+            if gallery_urls:
+                referer = (page.url or "").split("#")[0] or "https://www.heydealer.com/"
+                saved = _download_gallery_images_parallel(
+                    gallery_urls, product_id, detail_img_dir, referer
+                )
+                logging.info(
+                    "헤이딜러 이미지 저장(병렬 workers=%d): product_id=%s, 추출=%d건, 저장=%d건",
+                    HEYDEALER_DETAIL_IMG_WORKERS, product_id, len(gallery_urls), saved,
+                )
         except Exception as e:
             logging.warning("헤이딜러 이미지 저장 실패 product_id=%s: %s", product_id, e)
 
