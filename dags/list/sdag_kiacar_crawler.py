@@ -3,12 +3,15 @@ import logging
 import os
 import re
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
 import pendulum
+import requests
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
@@ -1340,6 +1343,88 @@ def _download_kiacar_card_first_img(page, li, save_dir: Path, product_id: str, l
         return ""
 
 
+def _extract_kiacar_card_img_url(li, page) -> str:
+    """
+    카드(li) 안의 첫 이미지 URL 만 추출 (다운로드 X). Playwright 메인 스레드 전용.
+    이후 _dl_kiacar_image_requests 로 ThreadPoolExecutor 병렬 다운로드.
+    """
+    selectors = [
+        "div.css-kn97bq a[rel='noopener noreferrer'] [class*='item-card__img'] img",
+        "div[class*='css-kn97bq'] a[rel='noopener noreferrer'] [class*='item-card__img'] img",
+        "div.img-wrap__discount.css-kn97bq a[rel='noopener noreferrer'] [class*='item-card__img'] img",
+        "div.img-wrap__discount[class*='css-kn97bq'] a[rel='noopener noreferrer'] [class*='item-card__img'] img",
+        "div.img-wrap__discount a[rel='noopener noreferrer'] [class*='item-card__img'] img",
+        "a[rel='noopener noreferrer'] [class*='item-card__img'][class*='reserved'] img",
+        "a[rel='noopener noreferrer'] [class*='item-card__img'] img",
+        "a[rel='noopener noreferrer'].item-card__img img",
+        "img[class*='item-card__img']",
+        "img",
+    ]
+    img_src = ""
+    for sel in selectors:
+        try:
+            img = li.locator(sel).first
+            if img.count() == 0:
+                continue
+            img_src = (
+                (img.get_attribute("src") or "").strip()
+                or (img.get_attribute("data-src") or "").strip()
+                or (img.get_attribute("srcset") or "").strip()
+                or (img.get_attribute("data-srcset") or "").strip()
+            )
+            if img_src:
+                break
+        except Exception:
+            continue
+    if not img_src:
+        try:
+            img_src = li.evaluate(
+                """el => {
+                  const img = el.querySelector('img');
+                  if (!img) return '';
+                  return (img.currentSrc || img.src || img.getAttribute('data-src') || '').trim();
+                }"""
+            ) or ""
+        except Exception:
+            img_src = ""
+    if not img_src:
+        return ""
+    if "," in img_src or " " in img_src:
+        try:
+            first = img_src.split(",")[0].strip()
+            img_src = first.split(" ")[0].strip() if first else img_src
+        except Exception:
+            pass
+    if img_src.startswith("data:"):
+        return ""
+    return img_src if img_src.startswith("http") else urljoin(page.url or URL, img_src)
+
+
+def _dl_kiacar_image_requests(args: tuple) -> bool:
+    """
+    ThreadPoolExecutor 에서 병렬 실행되는 이미지 다운로더.
+    Playwright API 는 thread-safe 하지 않아 requests 라이브러리 사용.
+    """
+    img_url, out_path, referer = args
+    if not img_url:
+        return False
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": referer or URL,
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+    }
+    try:
+        r = requests.get(img_url, headers=headers, timeout=15)
+        if r.status_code == 200 and r.content:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(r.content)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _load_kiacar_brand_lookup(brand_path: Path) -> dict[str, dict[str, str]]:
     key_to_brand: dict[str, dict[str, str]] = {}
     if not brand_path.exists():
@@ -1449,26 +1534,44 @@ def run_kiacar_list(
         page.wait_for_selector(SELECTOR_CAR_LIST_ROOT, timeout=20000)
         page.wait_for_timeout(800)
 
+        # 무한 스크롤 종료 판정:
+        #   - 카드 수가 stable_threshold 회 연속 동일하면 "다 로드됨" 으로 판정
+        #   - 한 번 스크롤 후 wait_ms 대기 (서버 네트워크 지연 환경 고려)
+        #   - max_loop 가 안전 제한 (실제론 stable 로 일찍 끝남)
+        # 1225 대 사이트에서 241대만 잡히던 문제 → stable·wait·loop 한도 보강.
+        stable_threshold = 12        # 4 → 12 (12 × 1.5s = 18초 대기 후 종료)
+        wait_ms = 1500               # 900 → 1500 (lazy-load 응답 여유 확보)
+        max_loop = 500               # 260 → 500 (1225대도 도달 가능: 500 × 1.5s = 12.5분 한도)
+        log_every = 20               # 진행상황 로그 간격
+
         prev_n = -1
         stable = 0
-        for _ in range(260):
+        for it in range(max_loop):
             items_loc = page.locator(SELECTOR_CAR_ITEM)
             n = items_loc.count()
             if n == prev_n:
                 stable += 1
-                if stable >= 4 and n > 0:
+                if stable >= stable_threshold and n > 0:
+                    logger.info("기아 리스트 스크롤 종료: 카드=%d (stable=%d, iter=%d)", n, stable, it + 1)
                     break
             else:
+                if it > 0 and it % log_every == 0:
+                    logger.info("기아 리스트 스크롤 진행: 카드=%d (iter=%d)", n, it + 1)
                 stable = 0
             prev_n = n
             if n == 0:
                 page.wait_for_timeout(800)
                 continue
             try:
+                # 마지막 카드까지 스크롤 + 페이지 끝으로 한 번 더 강제 스크롤 (lazy-load 트리거 강화)
                 items_loc.nth(n - 1).scroll_into_view_if_needed(timeout=3000)
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             except Exception:
                 pass
-            page.wait_for_timeout(900)
+            page.wait_for_timeout(wait_ms)
+        else:
+            # for-else: break 없이 max_loop 도달 시
+            logger.warning("기아 리스트 스크롤 max_loop(%d) 도달 — 더 있을 가능성", max_loop)
 
         items_loc = page.locator(SELECTOR_CAR_ITEM)
         total_li = items_loc.count()
@@ -1477,6 +1580,10 @@ def run_kiacar_list(
         seen: set[str] = set()
         model_sn = 0
         progress_every = 100
+        # 이미지 다운로드를 메인 루프에서 빼서 끝나고 ThreadPoolExecutor 로 병렬 처리.
+        # 1225 카드 × 1~2초 직렬 다운로드(20~40분) → 8 worker 병렬(2~5분) 으로 축소.
+        img_jobs: list[tuple[str, Path, str]] = []  # (img_url, out_path, referer)
+
         with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=headers)
             w.writeheader()
@@ -1506,11 +1613,21 @@ def run_kiacar_list(
                 match_key = _kiacar_car_name_to_match_key(row.get("car_name_1") or car_name)
                 matched = _kiacar_find_brand(match_key, brand_map) if match_key else None
 
+                # scroll timeout 3000→1000ms (lazy-load 트리거 + img src 가져오기엔 1초로 충분)
                 try:
-                    li.scroll_into_view_if_needed(timeout=3000)
+                    li.scroll_into_view_if_needed(timeout=1000)
                 except Exception:
                     pass
-                car_imgs = _download_kiacar_card_first_img(page, li, list_save_dir, pid, logger) or ""
+
+                # 이미지 URL 만 추출. 실제 다운로드는 메인 루프 종료 후 병렬로 일괄 처리.
+                img_url = _extract_kiacar_card_img_url(li, page)
+                out_path = list_save_dir / pid / f"{pid}_list.png"
+                if img_url:
+                    img_jobs.append((img_url, out_path, page.url or URL))
+                    car_imgs = str(out_path.resolve())
+                else:
+                    car_imgs = ""
+
                 w.writerow(
                     {
                         "model_sn": model_sn,
@@ -1534,6 +1651,20 @@ def run_kiacar_list(
                     }
                 )
         logger.info("기아 리스트 저장 완료: %s (총 %d건)", csv_path, model_sn)
+
+        # ────────── 이미지 병렬 다운로드 ──────────
+        if img_jobs:
+            logger.info("기아 리스트 이미지 병렬 다운로드 시작: %d장 (max_workers=8)", len(img_jobs))
+            img_start = time.time()
+            saved = 0
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                for ok in ex.map(_dl_kiacar_image_requests, img_jobs):
+                    if ok:
+                        saved += 1
+            logger.info(
+                "기아 리스트 이미지 다운로드 완료: %d/%d 성공 (%.1fs)",
+                saved, len(img_jobs), time.time() - img_start,
+            )
     except Exception as e:
         logger.error("기아 리스트 수집 오류: %s", e, exc_info=True)
 
@@ -1596,6 +1727,9 @@ def run_kiacar_list_job(
         context = browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 800})
         install_route_blocking(context, block_resource_types=("media", "font"))
         page = context.new_page()
+        # Playwright 기본 timeout 30초 — DOM 누락 시 30초씩 대기하면 1225 카드에서 누적 거대.
+        # 3초로 줄임. (명시 timeout 쓰는 wait_for_selector·scroll_into_view 등은 영향 없음)
+        page.set_default_timeout(3000)
         try:
             run_kiacar_list(
                 page,
