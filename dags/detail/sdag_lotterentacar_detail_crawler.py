@@ -317,7 +317,7 @@ def lotterentacar_detail_crawl():
                             fail_reason or "상세 수집 결과 없음",
                         )
 
-                if idx % 50 == 0 or idx == total:
+                if idx == 1 or idx % (10 if total <= 100 else 50) == 0 or idx == total:
                     logging.info(
                         "롯데렌터카 상세 진행 [%d/%d] 성공=%d 실패=%d 스킵=%d",
                         idx,

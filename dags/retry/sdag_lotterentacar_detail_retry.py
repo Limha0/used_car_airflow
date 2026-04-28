@@ -155,10 +155,11 @@ def lotterentacar_detail_retry():
         detail_img_root.mkdir(parents=True, exist_ok=True)
 
         total = len(target_rows)
+        # 0건이든, total>0 이라도 전부 실패할 수 있으니 루프 진입 전에 헤더 CSV 를 미리 만들어둔다.
+        # 그래야 수집 성공 0건이어도 후속 load 태스크가 빈 CSV 를 정상적으로 처리함.
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+            csv.DictWriter(f, fieldnames=DETAIL_CSV_FIELDS).writeheader()
         if total == 0:
-            with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
-                w = csv.DictWriter(f, fieldnames=DETAIL_CSV_FIELDS)
-                w.writeheader()
             return str(csv_path)
 
         if total >= 100:
@@ -569,7 +570,11 @@ def _collect_lotte_detail_image_urls(page, root) -> list[str]:
 
 
 def _download_image(page, image_url: str, save_path: Path) -> bool:
-    """requests로 이미지 다운로드. Content-Type text/html만 제외."""
+    """
+    Playwright Chromium 세션으로 이미지 다운로드.
+    page.request 는 방금 정상 렌더된 페이지의 TLS·쿠키·HTTP2 세션을 재사용하므로,
+    서버 IP 가 이미지 CDN 에 블록/throttle 된 환경에서도 일반 사용자로 인식되어 통과한다.
+    """
     if not image_url:
         return False
 
@@ -581,29 +586,27 @@ def _download_image(page, image_url: str, save_path: Path) -> bool:
         referer = "https://tcar.lotterentacar.net/"
 
     headers = {
-        "Referer":         referer,
-        "User-Agent":      (
+        "Referer": referer,
+        "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         ),
-        "Accept":          "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+        "Sec-Fetch-Dest": "image",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Site": "same-site",
     }
 
     try:
-        resp = requests.get(image_url, headers=headers, timeout=30)
-        if resp.status_code != 200:
-            logging.debug("이미지 HTTP %d: %s", resp.status_code, image_url)
+        resp = page.request.get(image_url, timeout=10000, headers=headers)
+        if not resp or not resp.ok:
+            logging.debug("이미지 HTTP %s: %s", getattr(resp, "status", "?"), image_url)
             return False
-
-        content_type = resp.headers.get("Content-Type", "").lower()
-        if "text/html" in content_type or "application/json" in content_type:
-            logging.debug("이미지 아닌 응답(Content-Type=%s): %s", content_type, image_url)
-            return False
-
-        body = resp.content
+        body = resp.body()
         if not body:
             return False
-
+        # Playwright resp 는 Content-Type 접근 API 가 제한적 — 빈 body 만 검증 (리본카·현대차 retry 와 동일)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         save_path.write_bytes(body)
         return True

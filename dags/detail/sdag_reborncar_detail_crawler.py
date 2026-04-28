@@ -274,6 +274,11 @@ def reborncar_detail_crawl():
                     pass
 
                 pg = ctx.new_page()
+                # Playwright 기본 timeout 30초는 너무 길다. 상품마다 DOM 구조가
+                # 조금씩 달라서 _safe_text 등에서 존재하지 않는 요소를 30초씩 기다리면
+                # 여러 개 누적 → 상품당 수 분 조용히 허비. 3초로 줄여서 빠르게 넘김.
+                # (명시적 timeout 을 쓰는 goto_with_retry, scroll_into_view 등은 영향 없음)
+                pg.set_default_timeout(3000)
                 pg.add_init_script(
                     "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
                 )
@@ -322,7 +327,7 @@ def reborncar_detail_crawl():
                     )
                     continue
 
-                if idx == 1 or idx % 50 == 0 or idx == total:
+                if idx == 1 or idx % (10 if total <= 100 else 50) == 0 or idx == total:
                     logging.info(
                         "[%d/%d] 호출 대상 - product_id=%s, detail_url=%s",
                         idx,
@@ -692,10 +697,15 @@ def _download_image(page, image_url: str, save_path: Path) -> bool:
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
             ),
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+            "Sec-Fetch-Dest": "image",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "same-site",
         }
-        # page.request는 안정적이지만 순차 다운로드가 느려질 수 있어,
-        # 이미지 저장 단계에서는 requests로 병렬화할 수 있도록 별도 함수도 사용한다.
-        resp = page.request.get(image_url, timeout=30000, headers=headers)
+        # page.request는 Chromium 브라우저 세션을 그대로 사용해서
+        # 일반 requests 로 직접 접근이 봇 차단되는 CDN 에서도 통과한다.
+        resp = page.request.get(image_url, timeout=10000, headers=headers)
         if not resp or not resp.ok:
             return False
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1033,20 +1043,23 @@ def _crawl_one(
                     urls.append(src)
 
             if urls:
-                # 이미지 다운로드는 병렬 처리로 시간 단축(누락 없이 모두 저장)
-                referer = page_url or "https://www.reborncar.co.kr/"
-                jobs = []
-                max_workers = 6 if len(urls) >= 6 else max(2, min(4, len(urls)))
-                with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                    for idx_img, src in enumerate(urls, start=1):
-                        out = detail_img_dir / f"{product_id}_{idx_img}.png"
-                        jobs.append(ex.submit(_download_image_requests, src, out, referer=referer))
-                    # 결과 소비(예외 삼킴). 실패해도 다음 이미지 계속 진행.
-                    for fut in as_completed(jobs):
-                        try:
-                            fut.result()
-                        except Exception:
-                            pass
+                # 이미지 다운로드는 Chromium 브라우저 세션(page.request)을 사용.
+                # requests 직접 호출은 서버 IP 가 CDN 에 블록되는 환경에서 실패하지만,
+                # 방금 정상 렌더한 페이지 세션으로는 통과한다 (동일 TLS/쿠키).
+                # 순차 처리라 속도는 병렬보다 느리지만, 블록 환경에서의 생존성이 우선.
+                img_start = time.time()
+                saved = 0
+                for idx_img, src in enumerate(urls, start=1):
+                    out = detail_img_dir / f"{product_id}_{idx_img}.png"
+                    if _download_image(page, src, out):
+                        saved += 1
+                logging.info(
+                    "리본카 이미지: product_id=%s 저장=%d/%d (%.1fs)",
+                    product_id,
+                    saved,
+                    len(urls),
+                    time.time() - img_start,
+                )
         except Exception:
             pass
 

@@ -294,7 +294,7 @@ def autoinside_detail_crawl():
                     )
                     continue
 
-                if idx == 1 or idx % 50 == 0 or idx == total:
+                if idx == 1 or idx % (10 if total <= 100 else 50) == 0 or idx == total:
                     logging.info(
                         "[%d/%d] 호출 대상 - product_id=%s, detail_url=%s",
                         idx,

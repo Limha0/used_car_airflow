@@ -136,10 +136,11 @@ def kiacar_detail_retry():
         detail_base.mkdir(parents=True, exist_ok=True)
 
         total = len(target_rows)
+        # 0건이든, total>0 이라도 전부 실패할 수 있으니 루프 진입 전에 헤더 CSV 를 미리 만들어둔다.
+        # 그래야 수집 성공 0건이어도 후속 load 태스크가 빈 CSV 를 정상적으로 처리함.
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+            csv.DictWriter(f, fieldnames=DETAIL_CSV_FIELDS).writeheader()
         if total == 0:
-            with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
-                w = csv.DictWriter(f, fieldnames=DETAIL_CSV_FIELDS)
-                w.writeheader()
             return str(csv_path)
 
         # 중간 진행 로그: 1건째 반드시 출력 + 이후 N건 간격(누적 수집 성공 건수 확인용)
