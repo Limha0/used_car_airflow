@@ -34,6 +34,7 @@ from util.playwright_util import GotoSpec, goto_with_retry, install_route_blocki
     schedule="@daily",
     start_date=pendulum.datetime(2026, 3, 1, tz="Asia/Seoul"),
     catchup=False,
+    # max_active_runs=1,    # 체인 트리거 + 안전망 스케줄 중복 방지
     render_template_as_native_obj=True,
     tags=["used_car", "lotterentacar", "crawler", "day"],
 )
@@ -552,7 +553,7 @@ LIST_DEFAULT_PARAMS = {
     "checkedCenterCodes": "", "option": "", "carNumber": "", "keyword": "",
     "themeId": "", "themeType": "", "themeSaleType": "", "brandCert": "",
     "retailShopId": "", "dealerRegKey": "", "sellAdminKey": "", "cert": "",
-    "manage": "", "promotion": "", "reqDirect": "", "consult": "", "rentBuy": "",
+    "manage": "", "promotion": "", "separatePromotion": "true", "reqDirect": "", "consult": "", "rentBuy": "",
     "tagList": "", "sTagList": "", "saleTyAll": "true", "saleTyRent": "", "saleTySale": "",
     "perPageNum": "100",  # 서버가 한 응답에 전부 안 넣어주는 경우가 있어 페이지 단위로 나눠 요청
 }
@@ -1225,6 +1226,7 @@ def _collect_lotterentacar_list_items_via_ajax(logger) -> list[dict[str, Any]]:
 
     items: list[dict[str, Any]] = []
     seen_keys: set[tuple[str, str]] = set()
+    carid_to_cartype: dict[str, str] = {}
     api_total_sum = 0
     last_car_total_count = None
 
@@ -1289,6 +1291,8 @@ def _collect_lotterentacar_list_items_via_ajax(logger) -> list[dict[str, Any]]:
                     continue
                 if product_id:
                     seen_keys.add(dedupe_key)
+                    if product_id not in carid_to_cartype:
+                        carid_to_cartype[product_id] = car_type_val
                 normalized = dict(item)
                 normalized["resolved_car_type"] = car_type_val
                 items.append(normalized)
@@ -1311,84 +1315,79 @@ def _collect_lotterentacar_list_items_via_ajax(logger) -> list[dict[str, Any]]:
         last_car_total_count if last_car_total_count is not None else "N/A",
     )
 
-    # ── 한정특가(promotion=true) 전용 수집 ──
-    promo_collected = 0
-    promo_page = 1
-    promo_total = 0
+    # ── cd별 한정특가(promotion=true) 보강 수집: per-cd 일반 루프에서 promotionListData가 누락된 차량까지 잡기 ──
+    promo_total_added = 0
     promo_per_page = 100
-    while True:
-        promo_params = {
-            **LIST_DEFAULT_PARAMS,
-            "promotion": "true",
-            "perPageNum": str(promo_per_page),
-            "page": str(promo_page),
-            "shuffleKey": "1",
-            "_": str(int(time.time() * 1000)),
-        }
-        try:
-            r = requests.get(
-                URL_LIST,
-                params=promo_params,
-                headers=REQUEST_HEADERS,
-                timeout=LIST_API_TIMEOUT,
-            )
-            r.raise_for_status()
-            body = r.json()
-        except Exception as e:
-            logger.warning("[한정특가] API page=%d 실패: %s", promo_page, e)
-            break
-
-        result = body.get("result") or body
-        if promo_page == 1:
-            promo_total = int(
-                result.get("recordsPromotionFiltered")
-                or result.get("recordsFiltered")
-                or 0
-            )
-            logger.info("[한정특가] 수집 시작: 총 %d건 대상", promo_total)
-            if promo_total == 0:
+    for cd, car_type_name in cd_to_name.items():
+        car_type_val = car_type_name or cd
+        promo_page = 1
+        promo_added_for_type = 0
+        while True:
+            promo_params = {
+                **LIST_DEFAULT_PARAMS,
+                "carType": f'["{cd}"]',
+                "promotion": "true",
+                "separatePromotion": "",
+                "perPageNum": str(promo_per_page),
+                "page": str(promo_page),
+                "shuffleKey": "1",
+                "_": str(int(time.time() * 1000)),
+            }
+            try:
+                r = requests.get(
+                    URL_LIST,
+                    params=promo_params,
+                    headers=REQUEST_HEADERS,
+                    timeout=LIST_API_TIMEOUT,
+                )
+                r.raise_for_status()
+                body = r.json()
+            except Exception as e:
+                logger.warning("[%s 한정특가] page=%d 실패: %s", car_type_val, promo_page, e)
                 break
 
-        # promotionListData + data 모두 수집 (중복은 seen_keys로 제거)
-        page_items: list[dict[str, Any]] = []
-        for item in result.get("promotionListData") or []:
-            if isinstance(item, dict):
-                page_items.append(item)
-        for item in result.get("data") or []:
-            if isinstance(item, dict):
-                page_items.append(item)
+            result = body.get("result") or body
+            page_items: list[dict[str, Any]] = []
+            for item in result.get("promotionListData") or []:
+                if isinstance(item, dict):
+                    page_items.append(item)
+            for item in result.get("data") or []:
+                if isinstance(item, dict):
+                    page_items.append(item)
 
-        if not page_items:
-            break
+            if not page_items:
+                break
 
-        new_this_page = 0
-        for item in page_items:
-            product_id = str(item.get("carId") or "").strip()
-            saletype = str(item.get("saletype") or "").strip()
-            dedupe_key = (product_id, saletype)
-            if product_id and dedupe_key in seen_keys:
-                continue
-            if product_id:
-                seen_keys.add(dedupe_key)
-            normalized = dict(item)
-            normalized["resolved_car_type"] = "한정특가"
-            items.append(normalized)
-            promo_collected += 1
-            new_this_page += 1
+            new_this_page = 0
+            for item in page_items:
+                product_id = str(item.get("carId") or "").strip()
+                saletype = str(item.get("saletype") or "").strip()
+                dedupe_key = (product_id, saletype)
+                if product_id and dedupe_key in seen_keys:
+                    continue
+                if product_id:
+                    seen_keys.add(dedupe_key)
+                    if product_id not in carid_to_cartype:
+                        carid_to_cartype[product_id] = car_type_val
+                normalized = dict(item)
+                normalized["resolved_car_type"] = car_type_val
+                items.append(normalized)
+                promo_added_for_type += 1
+                promo_total_added += 1
+                new_this_page += 1
 
-        logger.info(
-            "[한정특가] page=%d: 응답 %d건, 신규 %d건, 누적 %d/%d",
-            promo_page, len(page_items), new_this_page, promo_collected, promo_total,
-        )
+            logger.info(
+                "[%s 한정특가] page=%d: 응답 %d건, 신규 %d건, 누적 %d",
+                car_type_val, promo_page, len(page_items), new_this_page, promo_added_for_type,
+            )
 
-        # data 기준 페이지네이션 (promotionListData는 매 페이지 동일할 수 있음)
-        data_count = len(result.get("data") or [])
-        if data_count < promo_per_page:
-            break
-        promo_page += 1
-        time.sleep(0.1)
+            data_count = len(result.get("data") or [])
+            if data_count < promo_per_page:
+                break
+            promo_page += 1
+            time.sleep(0.1)
 
-    logger.info("[한정특가] 수집 완료: 신규 %d건 (전체 누적 %d건)", promo_collected, len(items))
+    logger.info("한정특가 cd별 보강 수집 완료: 신규 %d건 (전체 누적 %d건)", promo_total_added, len(items))
 
     return items
 

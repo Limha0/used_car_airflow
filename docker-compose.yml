@@ -1,0 +1,60 @@
+  x-airflow-common: &airflow-common
+    build: .
+    env_file: .env
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - /home/caradmin/car_data/crawl:/data/crawl
+      - /home/caradmin/car_data/img:/data/img
+      - /home/caradmin/car_data/log:/data/log
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+
+  services:
+    airflow-db:
+      image: postgres:15
+      environment:
+        POSTGRES_USER: airflow
+        POSTGRES_PASSWORD: airflow
+        POSTGRES_DB: airflow
+      volumes:
+        - airflow-db-data:/var/lib/postgresql/data
+      healthcheck:
+        test: ["CMD", "pg_isready", "-U", "airflow"]
+        interval: 10s
+        retries: 5
+
+     airflow-init:
+      <<: *airflow-common
+      entrypoint: /bin/bash
+      command:
+        - -lc
+        - |
+          airflow db migrate && \
+          airflow users create --username admin --password admin \
+            --firstname a --lastname b --role Admin --email a@b.c || true
+
+    airflow-scheduler:
+      <<: *airflow-common
+      command: scheduler
+      restart: unless-stopped
+      depends_on:
+        airflow-db:
+          condition: service_healthy
+        airflow-init:
+          condition: service_completed_successfully
+
+    airflow-webserver:
+      <<: *airflow-common
+      command: webserver
+      ports: ["8080:8080"]
+      restart: unless-stopped
+      depends_on:
+        airflow-db:
+          condition: service_healthy
+        airflow-init:
+          condition: service_completed_successfully
+
+  volumes:
+    airflow-db-data:
