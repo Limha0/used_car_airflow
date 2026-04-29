@@ -80,6 +80,7 @@ DETAIL_CSV_FIELDS = [
     schedule=None,
     start_date=pendulum.datetime(2026, 3, 1, tz="Asia/Seoul"),
     catchup=False,
+    max_active_runs=1,    # 체인 사이클 중첩 방지
     tags=["used_car", "hyundaicar", "detail", "crawler"],
 )
 def hyundaicar_detail_crawl():

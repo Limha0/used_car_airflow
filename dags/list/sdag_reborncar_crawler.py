@@ -1364,6 +1364,7 @@ def run_reborncar_list_job(
     schedule="@daily",
     start_date=pendulum.datetime(2026, 3, 1, tz="Asia/Seoul"),
     catchup=False,
+    max_active_runs=1,    # 체인 트리거 + 안전망 스케줄 중복 방지
     render_template_as_native_obj=True,
     tags=["used_car", "reborncar", "crawler", "day"],
 )

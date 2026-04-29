@@ -104,6 +104,7 @@ DETAIL_CSV_FIELDS = [
     schedule=None,
     start_date=pendulum.datetime(2026, 3, 1, tz="Asia/Seoul"),
     catchup=False,
+    max_active_runs=1,    # 체인 사이클 중첩 방지
     tags=["used_car", "kcar", "detail", "crawler"],
 )
 def kcar_detail_crawl():
@@ -281,6 +282,10 @@ def kcar_detail_crawl():
                 # 상세 PDP는 lazy·Vue로 썸네일 src 가 네트워크 이후 채워지는 경우가 많아 image 만 허용.
                 install_route_blocking(ctx, block_resource_types=("media", "font"))
                 pg = ctx.new_page()
+                # Playwright 기본 timeout 30초는 너무 길다. 상품마다 DOM 편차로
+                # _safe_text 등에서 존재하지 않는 요소를 30초씩 기다리면 누적되어 상품당 수 분 허비.
+                # 3초로 줄여서 빠르게 넘김 (명시 timeout 쓰는 goto/wait 은 영향 없음).
+                pg.set_default_timeout(3000)
                 # navigator.webdriver 탐지 회피용 초기 스크립트
                 pg.add_init_script(
                     "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
@@ -370,7 +375,7 @@ def kcar_detail_crawl():
 
                 _ensure_live_browser_page()
 
-                if idx == 1 or idx % 50 == 0 or idx == total:
+                if idx == 1 or idx % (10 if total <= 100 else 50) == 0 or idx == total:
                     logging.info(
                         "[%d/%d] 호출 대상 - product_id=%s, detail_url=%s",
                         idx,
@@ -489,6 +494,20 @@ def kcar_detail_crawl():
 
                 time.sleep(0.05)  # 서버 부하 방지(병렬 이미지 다운로드로 자연스러운 간격 확보)
 
+            # 정리 — route handler 등록된 상태로 close 하면 asyncio.CancelledError 가 다발 발생.
+            # 먼저 unroute 로 핸들러 제거하고 page → context → browser 순서로 정리.
+            try:
+                context.unroute("**/*")
+            except Exception:
+                pass
+            try:
+                page.close()
+            except Exception:
+                pass
+            try:
+                context.close()
+            except Exception:
+                pass
             try:
                 browser.close()
             except Exception:
@@ -1486,7 +1505,7 @@ def _crawl_one(page, idx: int, product_id: str, detail_url: str, detail_img_dir:
                 logger=logging.getLogger(__name__),
                 attempts=1,
             )
-            page.wait_for_timeout(400)
+            page.wait_for_timeout(200)
             _dismiss_kcar_popups(page)
             break
         except Exception as e:
@@ -1577,10 +1596,10 @@ def _crawl_one(page, idx: int, product_id: str, detail_url: str, detail_img_dir:
                 ".carInfoContainer .option-detail-box, .carInfoContainer .option-list-wrap"
             ).first
             if hint.count() > 0:
-                hint.scroll_into_view_if_needed(timeout=5000)
+                hint.scroll_into_view_if_needed(timeout=2000)
         except Exception:
             pass
-        page.wait_for_timeout(200)
+        page.wait_for_timeout(100)
 
         has_detail_box = _kcar_first_option_detail_box(page) is not None
         has_list_wrap = _kcar_first_option_list_wrap(page) is not None
@@ -1632,14 +1651,15 @@ def _crawl_one(page, idx: int, product_id: str, detail_url: str, detail_img_dir:
                     data["frame"] = _labels_ul_to_pipe(u2)
 
             # #ext / #frame 라벨은 캔버스·Vue 구조로 locator가 비는 경우가 있어 evaluate·다중 블록 순회
+            # 8회×5초 = 40초 worst case → 3회×2초 = 6초로 축소 (없는 차량은 빠르게 포기).
             if not str(data.get("ext_panel") or "").strip() or not str(data.get("frame") or "").strip():
                 n_dp = detail_pages.count()
-                for di in range(min(n_dp, 8)):
+                for di in range(min(n_dp, 3)):
                     pi = detail_pages.nth(di)
                     try:
                         ta = pi.locator(".threeDArea").first
                         if ta.count() > 0:
-                            ta.scroll_into_view_if_needed(timeout=5000)
+                            ta.scroll_into_view_if_needed(timeout=2000)
                     except Exception:
                         pass
                     ex_ev, fr_ev = _ext_frame_labels_from_scope_eval(pi)

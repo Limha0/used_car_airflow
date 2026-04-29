@@ -90,6 +90,7 @@ def _read_csv_rows(csv_path: Path) -> list[dict[str, Any]]:
     schedule=None,
     start_date=pendulum.datetime(2026, 3, 1, tz="Asia/Seoul"),
     catchup=False,
+    max_active_runs=1,    # 체인 사이클 중첩 방지
     tags=["used_car", "reborncar", "detail", "crawler"],
 )
 def reborncar_detail_crawl():

@@ -13,6 +13,7 @@ import pendulum
 import requests
 from airflow.decorators import dag, task, task_group
 from airflow.models import Variable
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 _root = Path(__file__).resolve().parent.parent
@@ -81,6 +82,7 @@ DETAIL_CSV_FIELDS = [
     schedule=None,
     start_date=pendulum.datetime(2026, 3, 1, tz="Asia/Seoul"),
     catchup=False,
+    max_active_runs=1,    # 체인 사이클 중첩 방지
     tags=["used_car", "reborncar", "detail", "retry"],
 )
 def reborncar_detail_retry():
@@ -404,7 +406,17 @@ def reborncar_detail_retry():
 
     prepared = prepare_retry()
     csv_path = retry_crawl(prepared)
-    load_retry_csv_to_ods(csv_path)
+    loaded = load_retry_csv_to_ods(csv_path)
+
+    # 사이클 종료 후 다음 사이클의 list DAG 를 즉시 트리거 (무한 체인).
+    trigger_next_cycle_list = TriggerDagRunOperator(
+        task_id="trigger_next_cycle_list",
+        trigger_dag_id="sdag_reborncar_crawler",
+        wait_for_completion=False,
+        reset_dag_run=False,
+    )
+
+    loaded >> trigger_next_cycle_list
 
 
 dag_object = reborncar_detail_retry()
